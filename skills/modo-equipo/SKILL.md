@@ -16,15 +16,18 @@ Detect what this machine has. Never fail because something is missing: degrade a
 |---|---|---|
 | Desktop app session tools | `mcp__ccd_session_mgmt__get_usage` and `mcp__ccd_session__start_session` are available (load them with ToolSearch if deferred) | `full` intensity runs in **manual mode** (Step 4). Plan usage %: ask the user to run `/usage` and tell you the weekly %. |
 | Engram memory | `mem_save` / `mem_current_project` tools exist | Skip the memory rules; the feature document is the only record. |
-| Python | `python3 --version`, else `python --version` | Skip the scripts. Report token totals as `unavailable` and skip the Gentle AI check. |
+| Python | Windows: `py -3 --version`, else `python --version`. Other systems: `python3 --version`, else `python --version`. Count it as found only if the output starts with `Python 3`: on Windows a bare `python3` or `python` can be a Microsoft Store shortcut that opens the Store instead, and on a Mac without developer tools `python3` offers to install them instead of running. | Skip the scripts. Report token totals as `unavailable` and skip the Gentle AI check. |
 | Gentle AI | `gentle-ai --version` succeeds, or `~/.claude/CLAUDE.md` contains `<!-- gentle-ai:` | The Gentle AI sections below do nothing. |
 | Second screen (Windows) | `scripts/second-screen/detect.ps1` prints `"secondScreen":true` | Tests run the normal way. Ask once if the user wants a guide to create a virtual screen (see "Second screen for tests"). |
 
+Then run the check in "Same rule in every session (opt-in)".
+
 Persistent data for this skill lives in `~/.claude/modo-equipo/`, never inside the skill folder, so plugin updates never erase it:
+- `preferences.md`: the user's answers (`second-screen: declined`, `global-rule: declined`).
 - `cost-history.md`: one line per closed team (Step 6).
 - `gentle-baseline/`: the Gentle AI snapshot (see "Syncing improvements from Gentle AI").
 
-In the commands below, `PY` means `python3` if it exists, else `python`.
+In the commands below, `PY` means the first Python command that passed that check (`py -3`, `python3` or `python`).
 
 ## Gentle AI is OFF while this mode is active
 
@@ -38,7 +41,7 @@ Everything outside those blocks still applies: the user's own rules in `CLAUDE.m
 
 ## Second screen for tests (Windows, optional)
 
-Rule: while this mode is active, every test run (development or QA, any session) goes to the second screen when one exists, so the user keeps working on the main screen. If there is none, run tests the normal way. Never block or fail because of it.
+Rule: anything a test opens that would show up on, or get in the way of, the main screen (test runner windows, emulators, app windows) goes to the second screen when one exists, so the user keeps working on the main screen. Tests that never interfere (headless runs, the built-in browser, code-level automation) can run anywhere. If there is no second screen, run tests the normal way. Never block or fail because of it.
 
 Check once per team, before the first test run. Skip the whole section on non-Windows systems.
 1. Read `~/.claude/modo-equipo/preferences.md`. If it contains `second-screen: declined`, run tests normally and stop here.
@@ -54,6 +57,22 @@ Check once per team, before the first test run. Skip the whole section on non-Wi
    - no, don't ask again: write `second-screen: declined` to `~/.claude/modo-equipo/preferences.md`.
 
 Never download, install a driver or run a third-party program for this on your own. Missing Python, bun or other test tools are reported in the suite result, not installed silently.
+
+## Same rule in every session (opt-in)
+
+The user may want the test rules (second screen, never borrowing their mouse or keyboard) in all their Claude Code sessions, not only while this mode is active. The skill only loads when invoked, so this is done with a small marked block in the user's `~/.claude/CLAUDE.md`. Its exact text is in `${CLAUDE_SKILL_DIR}/references/global-rule.md`.
+
+The helper `PY "${CLAUDE_SKILL_DIR}/scripts/global_rule.py" status|install|remove` does the file work: it only touches the marked block, appends it at the end of the file (after any block managed by another tool), and replaces an older version in place. Without Python, do the same by hand.
+
+Check once per activation, during the Environment check:
+1. Read `~/.claude/modo-equipo/preferences.md`. If it contains `global-rule: declined`, skip this section.
+2. Run `status`. `current vN`: skip.
+3. `outdated vN`: tell the user in one line and offer to update it; on yes, run `install`.
+4. `missing`: ask ONE question: "Apply the test rules (second screen, never using your mouse or keyboard) to all your Claude sessions? It adds a short marked block to ~/.claude/CLAUDE.md. (yes / no / no, don't ask again)". Then stop and wait.
+   - yes: run `install`; it must print `current vN`.
+   - no: continue; ask again next activation.
+   - no, don't ask again: write `global-rule: declined` to `~/.claude/modo-equipo/preferences.md`.
+5. To remove it later, run `remove`.
 
 ## Built-in rules (apply to every session)
 
@@ -79,9 +98,17 @@ Never download, install a driver or run a third-party program for this on your o
   - Keep scratch files outside the repository, in `mktemp -d`.
   - If no meaningful test is possible, say why and run a proportionate manual check.
 - **Never borrow the user's mouse or keyboard**: tests and automation must not move the real cursor, send real keystrokes, or take window focus, so the user can keep working while they run. Never ask the user to stop typing or moving the mouse.
-  - Drive apps by code instead: browser automation (Playwright, the built-in browser), messages sent to a specific window, or virtual input devices.
-  - Emulators: use a virtual pad with background input, never keyboard injection. For Dolphin and other DSU-capable emulators follow `${CLAUDE_SKILL_DIR}/references/virtual-pad.md`; it uses the driverless `${CLAUDE_SKILL_DIR}/scripts/virtual-pad/dsu_server.py`.
-  - If a task truly cannot run without the real mouse or keyboard (for example computer-use on a native app), say so before starting, give the expected duration, and wait for the user's OK.
+  - Pick the input method by what the test needs, first fit wins:
+
+    | The test drives | Use | Not |
+    |---|---|---|
+    | Code, CLI, APIs | The test runner itself | — |
+    | Web pages | Playwright or the built-in browser (headless or in its own pane) | Clicking a real browser window |
+    | A standard Windows app (Win32, WPF, WinForms) | UI Automation (for example pywinauto `uia` backend) or messages to that window's handle | SendInput, pyautogui |
+    | An emulator or game | A virtual pad with background input: `${CLAUDE_SKILL_DIR}/references/virtual-pad.md` with the driverless `${CLAUDE_SKILL_DIR}/scripts/virtual-pad/dsu_server.py` | Keyboard injection plus focus stealing |
+    | Anything that only works with a real cursor (computer-use on a native app) | An isolated cursor from `${CLAUDE_SKILL_DIR}/references/own-cursor.md` | The user's cursor |
+
+  - If none of those fits and the task truly needs the user's real mouse or keyboard, say so before starting, give the expected duration, and wait for the user's OK.
 - **Risk line**: every code change reported to the coordinator ends with `Risk: none` or `Risk: <what could break and why>`. A risky change (stored data, security, public contracts, concurrency, install/CI, or nothing would catch a regression) needs QA PASS before `merged`, never self-check only.
 
 ## Syncing improvements from Gentle AI

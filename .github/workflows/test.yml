@@ -1,0 +1,65 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest runs on Apple Silicon (arm64), like current Macs.
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Machine
+        run: |
+          uname -a
+          python --version
+
+      - name: Script tests
+        run: python -m unittest discover -s tests -v
+
+      - name: PowerShell scripts (Windows only)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $total = 0
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors)
+            $total += $errors.Count
+          }
+          "parse errors: $total"
+          if ($total -ne 0) { exit 1 }
+          powershell -NoProfile -ExecutionPolicy Bypass -File skills/modo-equipo/scripts/second-screen/screen-viewer.ps1 -SelfTest
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Validate and install the plugin in a clean Claude Code
+        env:
+          CLAUDE_CONFIG_DIR: ${{ runner.temp }}/claude-config
+        run: |
+          claude --version
+          claude plugin validate .
+          claude plugin marketplace add ./
+          claude plugin install modo-equipo@modo-equipo-marketplace
+          claude plugin details modo-equipo | tee details.txt
+          grep -q "Skills (1)" details.txt

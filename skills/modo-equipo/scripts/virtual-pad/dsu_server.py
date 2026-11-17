@@ -1,15 +1,19 @@
 """Minimal cemuhook/DSU pad server for Dolphin (one virtual pad in slot 0).
 
-Dolphin connects as a DSU client to 127.0.0.1:26760. A second UDP port
-(26761, localhost only) accepts text commands to change the pad state:
+Usage: python dsu_server.py [log-file] [--port 26760] [--ctrl-port 26761]
+
+The emulator connects as a DSU client to 127.0.0.1:<port>. A second UDP port
+(<ctrl-port>, localhost only) accepts text commands to change the pad state:
   press <Input> <ms>    hold an input for <ms> then release (e.g. press Cross 150)
   hold <Input>          hold until "release <Input>"
   release <Input>
   stick <lx> <ly>       left stick bytes 0..255 (128 = center)
   quit
 Inputs: Cross Circle Square Triangle L1 R1 L2 R2 PadN PadS PadE PadW Options Share
-Events are appended to the log file given as argv[1] (default dsu_log.txt).
+Events are appended to the log file (default dsu_log.txt). Use different ports
+for each test that runs at the same time; both ports must be free.
 """
+import argparse
 import binascii
 import socket
 import struct
@@ -17,8 +21,6 @@ import sys
 import threading
 import time
 
-DSU_PORT = 26760
-CTRL_PORT = 26761
 VERSION = 1001
 SERVER_ID = 0x1234ABCD
 MSG_VERSION, MSG_PORTS, MSG_DATA = 0x100000, 0x100001, 0x100002
@@ -32,7 +34,7 @@ state.update({name: 0 for name in BITS1})
 stick = [128, 128]
 clients = {}
 counter = 0
-log_path = sys.argv[1] if len(sys.argv) > 1 else "dsu_log.txt"
+log_path = "dsu_log.txt"
 
 
 def log(text):
@@ -156,15 +158,22 @@ def ctrl_loop(ctrl):
 
 
 def main():
+    global log_path
+    parser = argparse.ArgumentParser(description="Minimal DSU pad server (one pad, slot 0).")
+    parser.add_argument("log", nargs="?", default="dsu_log.txt", help="event log file")
+    parser.add_argument("--port", type=int, default=26760, help="DSU port the emulator connects to")
+    parser.add_argument("--ctrl-port", type=int, default=26761, help="localhost port for text commands")
+    args = parser.parse_args()
+    log_path = args.log
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("127.0.0.1", DSU_PORT))
+    sock.bind(("127.0.0.1", args.port))
     if hasattr(socket, "SIO_UDP_CONNRESET"):
         sock.ioctl(socket.SIO_UDP_CONNRESET, False)
     ctrl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    ctrl.bind(("127.0.0.1", CTRL_PORT))
+    ctrl.bind(("127.0.0.1", args.ctrl_port))
     threading.Thread(target=dsu_loop, args=(sock,), daemon=True).start()
     threading.Thread(target=send_loop, args=(sock,), daemon=True).start()
-    log("server up")
+    log(f"server up port={args.port} ctrl={args.ctrl_port}")
     try:
         ctrl_loop(ctrl)
     except SystemExit:

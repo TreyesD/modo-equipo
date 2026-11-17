@@ -25,6 +25,8 @@ Antes de lanzar nada, la skill verifica si el trabajo se puede dividir de verdad
 
 La skill prohíbe que las pruebas usen tu mouse o teclado reales, o que te quiten el foco de la ventana. Para emuladores (Dolphin y otros compatibles con DSU) incluye un control virtual sin drivers, [`scripts/virtual-pad/dsu_server.py`](skills/modo-equipo/scripts/virtual-pad/dsu_server.py), con su receta en [`references/virtual-pad.md`](skills/modo-equipo/references/virtual-pad.md). Así el juego recibe los controles aunque su ventana no esté activa, y tú sigues trabajando.
 
+Si quieres, la skill también puede aplicar estas reglas en **todas** tus sesiones de Claude: te pregunta una sola vez y, si dices que sí, agrega un bloque corto y marcado a tu `~/.claude/CLAUDE.md`. Para casos que de verdad necesitan un cursor, [`references/own-cursor.md`](skills/modo-equipo/references/own-cursor.md) compara opciones para darle a Claude su propio cursor sin usar el tuyo. La skill nunca las instala sola.
+
 ## Instalación
 
 ### Opción A: como plugin (recomendada)
@@ -64,6 +66,14 @@ No uses las dos opciones a la vez: la skill quedaría duplicada.
 3. Te muestra el costo estimado y espera tu OK.
 4. El estado compartido queda en `odd/tasks/<feature>.md`, dentro de tu proyecto.
 5. Al cerrar, te muestra lo que costó de verdad y lo agrega a `~/.claude/modo-equipo/cost-history.md`. Con ese historial, los pronósticos siguientes salen más precisos.
+
+## Pruebas automáticas
+
+Cada cambio se prueba solo en GitHub en **macOS (Apple Silicon), Linux y Windows**: los scripts de la skill y una instalación limpia del plugin en Claude Code. Para correr las pruebas en tu equipo:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Licencia
 

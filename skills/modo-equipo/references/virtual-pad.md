@@ -9,16 +9,17 @@ Verified on Windows 10 with Dolphin 2609b and a GameCube game: with Dolphin unfo
 ## 1. Start the pad server
 
 ```
-python dsu_server.py <log-file>
+python dsu_server.py <log-file> [--port 26760] [--ctrl-port 26761]
 ```
 
-- Pad slot 0, served on `127.0.0.1:26760`.
-- Commands go to UDP `127.0.0.1:26761` as plain text:
+- Pad slot 0, served on `127.0.0.1:<port>` (default 26760).
+- Commands go to UDP `127.0.0.1:<ctrl-port>` (default 26761) as plain text:
   - `press <Input> <ms>`: hold an input, then release it.
   - `hold <Input>` / `release <Input>`.
   - `stick <lx> <ly>`: left stick bytes 0..255, 128 = center.
   - `quit`.
 - Inputs: `Cross Circle Square Triangle L1 R1 L2 R2 PadN PadS PadE PadW Options Share`.
+- Two tests at the same time need different ports for each server, and each emulator profile's `DSUClient.ini` must point at its own `--port`.
 - Example from Python: `socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"press Cross 120", ("127.0.0.1", 26761))`.
 
 ## 2. Give the emulator its own test profile (Dolphin)
