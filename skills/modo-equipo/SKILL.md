@@ -41,7 +41,13 @@ Everything outside those blocks still applies: the user's own rules in `CLAUDE.m
 
 ## Second screen for tests (Windows, optional)
 
-Rule: anything a test opens that would show up on, or get in the way of, the main screen (test runner windows, emulators, app windows) goes to the second screen when one exists, so the user keeps working on the main screen. Tests that never interfere (headless runs, the built-in browser, code-level automation) can run anywhere. If there is no second screen, run tests the normal way. Never block or fail because of it.
+Rule: when a second screen exists, EVERY window a test opens goes there, always, whatever the number of windows (main window, render or game window, dialogs, consoles, child processes, each new launch). No window may appear on the main screen, not even for a moment, so the user keeps working on the main screen. Tests that never open a window (headless runs, the built-in browser, code-level automation) can run anywhere. If there is no second screen, run tests the normal way. Never block or fail because of it.
+
+How to meet it:
+- Place the window before it is shown: the app's own position or geometry setting, launch options, or a saved window layout on the second screen. Moving it after it appears is a fallback, never the plan.
+- If an app can only be moved after it appears, start it off-screen or hidden when the app allows it, then move it, without taking focus (`SWP_NOACTIVATE`, `SW_SHOWNOACTIVATE`).
+- Before the first run and after any change, list ALL visible windows of the test's processes, not only the main window, and check every one sits on the second screen.
+- If a window still reaches the main screen, stop that test, report it to the coordinator, and fix it before the next run.
 
 Check once per team, before the first test run. Skip the whole section on non-Windows systems.
 1. Read `~/.claude/modo-equipo/preferences.md`. If it contains `second-screen: declined`, run tests normally and stop here.
