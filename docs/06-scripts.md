@@ -112,7 +112,8 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 
 **Contrato:**
 - Uso: `powershell -NoProfile -ExecutionPolicy Bypass -STA -File scripts/second-screen/screen-viewer.ps1`
-- Clic izquierdo, derecho y central, arrastre y rueda sobre la imagen se reproducen en el punto equivalente de la segunda pantalla; el cursor vuelve a su posición. Los clics sobre las franjas negras se ignoran.
+- Modo directo: al pasar el mouse sobre la imagen, el cursor real salta a la segunda pantalla y se mueve escalado (sigue a tu mano 1:1 sobre la imagen). Clic, doble clic, arrastre y rueda son input nativo. Al pasar el borde de la imagen, el cursor vuelve a tu pantalla principal; con un botón apretado el arrastre continúa y no se escapa.
+- Consumo: unos 20 cuadros por segundo en modo directo y 8 en reposo (≈15 % de un núcleo en reposo); el bucle fino de 8 ms solo corre mientras el cursor está en modo directo.
 - Trabaja en píxeles reales por pantalla (Per-Monitor DPI v2), necesario con escalas distintas entre pantallas.
 - `-SelfTest`: prueba la conversión de coordenadas sin abrir ventanas (código 0 = pasa).
 - `MODO_EQUIPO_VIEWER_LOG=<archivo>`: registra los eventos para diagnosticar.
