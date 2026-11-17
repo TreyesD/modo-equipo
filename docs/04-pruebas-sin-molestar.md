@@ -39,8 +39,11 @@ Si nada de eso sirve, Claude tiene que avisarte antes, decirte cuánto va a tard
 - **Doble clic** funciona: dos clics seguidos llegan como doble clic.
 - **Teclado**: al hacer clic en una ventana de la segunda pantalla, esa ventana queda activa y lo que escribes va a ella. Para volver, haz clic en tu pantalla.
 - **Para salir**: empuja el mouse más allá de cualquier borde de la imagen, o aprieta **Ctrl+Alt+Q**.
-- Un **punto rojo** muestra dónde está el cursor cuando pasa por la segunda pantalla.
-- Casilla **"Always on top"**: mantiene el visor encima de todo.
+- La imagen la dibuja la tarjeta gráfica (Magnification API de Windows): unos **60 cuadros por segundo** y el **cursor real** de la segunda pantalla. Si una app dibuja su propio puntero (por ejemplo un juego), apaga el botón de puntero para no ver dos.
+- La ventana **no tiene barra de título de Windows**: arrastra la franja de arriba para moverla y sus bordes para cambiar el tamaño.
+- **Barra de opciones** flotante (por fuera de la ventana, arriba; abajo si no hay espacio): mantener encima de todo, puntero, silenciar, pantalla completa, ocultar la barra, minimizar y cerrar. Si la ocultas, vuelve al pasar el mouse por la franja de arriba.
+- **Silenciar** apaga el sonido de las apps que están en la segunda pantalla (Windows no permite silenciar una pantalla). Si la misma app también está en tu pantalla, se silencia entera.
+- **Pantalla completa**: el visor ocupa toda tu pantalla, la barra se esconde sola y aparece arriba al salir del modo directo (borde o **Ctrl+Alt+Q**). "Siempre encima" solo existe en la ventana pequeña.
 - Funciona con pantallas de **escalas distintas** (por ejemplo 125% y 100%).
 
 ### 4. Control virtual para emuladores

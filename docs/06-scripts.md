@@ -138,9 +138,11 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 - Uso: `powershell -NoProfile -ExecutionPolicy Bypass -STA -File scripts/second-screen/screen-viewer.ps1`
 - Modo directo: al pasar el mouse sobre la imagen, el cursor real salta a la segunda pantalla y se mueve escalado (sigue a tu mano 1:1 sobre la imagen). Clic, doble clic, arrastre y rueda son input nativo. Al pasar el borde de la imagen, el cursor vuelve a tu pantalla principal; con un botón apretado el arrastre continúa y no se escapa. Funciona en cualquier borde, también en los bordes exteriores del escritorio, donde Windows frena el cursor: el visor lee el movimiento crudo del mouse (Raw Input) y sale cuando sigues empujando hacia afuera.
 - Salida de emergencia: `Ctrl+Alt+Q` saca el cursor del modo directo desde cualquier lugar. Si otra app ya usa esa combinación, el visor lo avisa en su barra y queda solo la salida por los bordes.
-- Consumo: unos 20 cuadros por segundo en modo directo y 8 en reposo (≈15 % de un núcleo en reposo); el bucle fino de 8 ms solo corre mientras el cursor está en modo directo.
+- Imagen: Magnification API de Windows (GPU, cursor real), unos 60 cuadros por segundo en modo directo o pantalla completa y 30 en reposo. Si la API no está disponible, vuelve a la copia GDI anterior (20 / 8 cuadros por segundo, punto rojo como cursor).
+- Ventana sin barra de título: franja superior para mover, bordes para cambiar el tamaño, y una barra flotante con siempre encima (solo en ventana pequeña), puntero, silenciar (apps de la segunda pantalla, sin tocar procesos del sistema), pantalla completa, ocultar, minimizar y cerrar.
 - Trabaja en píxeles reales por pantalla (Per-Monitor DPI v2), necesario con escalas distintas entre pantallas.
-- `-SelfTest`: prueba la conversión de coordenadas sin abrir ventanas (código 0 = pasa).
+- `-SelfTest`: prueba la conversión de coordenadas, el encuadre de la imagen y la ubicación de la barra sin abrir ventanas (código 0 = pasa).
+- `-Smoke [-SmokeSeconds N]`: abre el visor unos segundos en la segunda pantalla, sin modo directo, e imprime qué motor de imagen usó (chequeo de desarrollo).
 - `MODO_EQUIPO_VIEWER_LOG=<archivo>`: registra los eventos para diagnosticar.
 - Sin segunda pantalla: muestra un aviso y termina con código 1.
 
