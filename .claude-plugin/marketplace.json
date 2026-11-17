@@ -1,0 +1,14 @@
+{
+  "name": "modo-equipo-marketplace",
+  "description": "Marketplace for the modo-equipo plugin",
+  "owner": {
+    "name": "TreyesD"
+  },
+  "plugins": [
+    {
+      "name": "modo-equipo",
+      "source": "./",
+      "description": "On-demand multi-session team mode: coordinator, development and QA sessions with a token-cost gate."
+    }
+  ]
+}

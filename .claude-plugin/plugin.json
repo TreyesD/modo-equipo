@@ -1,0 +1,11 @@
+{
+  "name": "modo-equipo",
+  "version": "1.0.0",
+  "description": "On-demand multi-session team mode for Claude Code: coordinator, single-writer development and read-only QA sessions, with a token-cost gate.",
+  "author": {
+    "name": "TreyesD"
+  },
+  "repository": "https://github.com/TreyesD/modo-equipo",
+  "license": "MIT",
+  "keywords": ["multi-session", "orchestration", "qa", "token-cost"]
+}
