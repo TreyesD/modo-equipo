@@ -46,7 +46,7 @@ Check once per team, before the first test run. Skip the whole section on non-Wi
 3. `"secondScreen":true`:
    - Run tests with `powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/scripts/second-screen/launch-on-second-screen.ps1" -Root "<project folder>"`. It opens the runner window on the second screen and returns at once.
    - Wait for the result with one background command that loops until `status` is `done` in `~/.claude/modo-equipo/tests-last.json`; do not poll turn by turn. Read per-suite `result` there and the details in `tests-last.log`. A suite with `missing-tool` is not a pass: report it.
-   - Tell the user once that `${CLAUDE_SKILL_DIR}/scripts/second-screen/screen-viewer.ps1` opens a small live view of that screen on the main one.
+   - Tell the user once that `${CLAUDE_SKILL_DIR}/scripts/second-screen/screen-viewer.ps1` opens a small live, touch-style view of that screen on the main one: click, right-click, drag and scroll on the image act on the second screen, and a click on a window there gives it keyboard focus.
    - Launcher exit code 2 means the screen vanished: run tests the normal way.
 4. `"secondScreen":false` (or the detect step fails): run tests the normal way, and ask the user ONE question, once per team: "No second screen found. Want a step-by-step guide to create a virtual one? (yes / no / no, don't ask again)". Then stop and wait.
    - yes: follow `${CLAUDE_SKILL_DIR}/references/second-screen.md`, explain each step in plain words, and let the user do every download, install and program launch. Re-run `detect.ps1` to confirm.
@@ -78,6 +78,10 @@ Never download, install a driver or run a third-party program for this on your o
   - For every existing behavior that shares the changed code, add one test proving it still works.
   - Keep scratch files outside the repository, in `mktemp -d`.
   - If no meaningful test is possible, say why and run a proportionate manual check.
+- **Never borrow the user's mouse or keyboard**: tests and automation must not move the real cursor, send real keystrokes, or take window focus, so the user can keep working while they run. Never ask the user to stop typing or moving the mouse.
+  - Drive apps by code instead: browser automation (Playwright, the built-in browser), messages sent to a specific window, or virtual input devices.
+  - Emulators: use a virtual pad with background input, never keyboard injection. For Dolphin and other DSU-capable emulators follow `${CLAUDE_SKILL_DIR}/references/virtual-pad.md`; it uses the driverless `${CLAUDE_SKILL_DIR}/scripts/virtual-pad/dsu_server.py`.
+  - If a task truly cannot run without the real mouse or keyboard (for example computer-use on a native app), say so before starting, give the expected duration, and wait for the user's OK.
 - **Risk line**: every code change reported to the coordinator ends with `Risk: none` or `Risk: <what could break and why>`. A risky change (stored data, security, public contracts, concurrency, install/CI, or nothing would catch a regression) needs QA PASS before `merged`, never self-check only.
 
 ## Syncing improvements from Gentle AI

@@ -17,9 +17,13 @@ Antes de lanzar nada, la skill verifica si el trabajo se puede dividir de verdad
 | Claude Code | Sí | — |
 | App de escritorio de Claude (pestaña Code) | No | El modo `full` pasa a modo manual: la skill te da los comandos para abrir cada sesión en su propia terminal. El % semanal se lo dices tú, leyéndolo con `/usage`. |
 | Python 3 | No | No se miden los tokens por sesión y no se revisan los cambios de Gentle AI. |
-| Windows + segunda pantalla (física o virtual) | No | Las pruebas corren de la forma normal. Si no hay segunda pantalla, la skill pregunta una vez si quieres una guía para crear una virtual ([`references/second-screen.md`](skills/modo-equipo/references/second-screen.md)); nunca descarga ni instala nada por su cuenta. Con segunda pantalla, todas las pruebas corren ahí y puedes verlas en vivo con `scripts/second-screen/screen-viewer.ps1`. |
+| Windows + segunda pantalla (física o virtual) | No | Las pruebas corren de la forma normal. Si no hay segunda pantalla, la skill pregunta una vez si quieres una guía para crear una virtual ([`references/second-screen.md`](skills/modo-equipo/references/second-screen.md)); nunca descarga ni instala nada por su cuenta. Con segunda pantalla, todas las pruebas corren ahí. Con `scripts/second-screen/screen-viewer.ps1` la ves en vivo y la usas como pantalla táctil: haces clic, arrastras o usas la rueda sobre la imagen y la acción ocurre en la segunda pantalla. |
 | [Engram](https://github.com/Gentleman-Programming/engram) (memoria) | No | El registro queda solo en el documento de la feature. |
 | [Gentle AI](https://github.com/Gentleman-Programming/gentle-ai) | No | Si lo tienes, la skill lo apaga mientras está activa y te avisa cuando Gentle AI cambia. |
+
+## Pruebas sin ocupar tu teclado ni tu mouse
+
+La skill prohíbe que las pruebas usen tu mouse o teclado reales, o que te quiten el foco de la ventana. Para emuladores (Dolphin y otros compatibles con DSU) incluye un control virtual sin drivers, [`scripts/virtual-pad/dsu_server.py`](skills/modo-equipo/scripts/virtual-pad/dsu_server.py), con su receta en [`references/virtual-pad.md`](skills/modo-equipo/references/virtual-pad.md). Así el juego recibe los controles aunque su ventana no esté activa, y tú sigues trabajando.
 
 ## Instalación
 

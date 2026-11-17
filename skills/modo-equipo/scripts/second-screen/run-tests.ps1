@@ -15,19 +15,29 @@ $log  = Join-Path $StateDir 'tests-last.log'
 $json = Join-Path $StateDir 'tests-last.json'
 $Root = (Resolve-Path $Root).Path
 
+# All output files are UTF-8 without BOM: Windows PowerShell 5.1 writes a BOM for
+# UTF-8, and strict JSON parsers reject it.
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
 function Write-State($status, $results) {
-    [pscustomobject]@{
+    $text = [pscustomobject]@{
         status  = $status
         root    = $Root
         updated = (Get-Date -Format s)
         suites  = @($results)
-    } | ConvertTo-Json -Depth 4 | Set-Content $json -Encoding utf8
+    } | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText($json, $text, $Utf8NoBom)
 }
+
+function Set-Log($text) { [System.IO.File]::WriteAllText($log, "$text`r`n", $Utf8NoBom) }
+function Add-Log($text) { [System.IO.File]::AppendAllText($log, "$text`r`n", $Utf8NoBom) }
 
 function Find-Suites($root) {
     $override = Join-Path $root '.modo-equipo-tests.json'
     if (Test-Path $override) {
-        return @(Get-Content $override -Raw | ConvertFrom-Json | ForEach-Object {
+        # Parentheses force enumeration: Windows PowerShell 5.1 ConvertFrom-Json emits a JSON
+        # array as one object, which breaks ForEach-Object when there are 2+ suites.
+        return @((Get-Content $override -Raw | ConvertFrom-Json) | ForEach-Object {
             @{ Name = $_.name; Dir = (Join-Path $root $_.dir); Cmd = $_.cmd }
         })
     }
@@ -59,7 +69,7 @@ function Find-Suites($root) {
     return $suites
 }
 
-"Run started $(Get-Date -Format s) in $Root" | Set-Content $log -Encoding utf8
+Set-Log "Run started $(Get-Date -Format s) in $Root"
 $suites = @(Find-Suites $Root)
 $results = @()
 Write-State 'running' $results
@@ -74,14 +84,14 @@ foreach ($s in $suites) {
     if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) {
         $msg = "MISSING TOOL: $exe is not installed or not on PATH"
         Write-Host $msg -ForegroundColor Red
-        Add-Content $log "=== $($s.Name) ===`n$msg" -Encoding utf8
+        Add-Log "=== $($s.Name) ===`n$msg"
         $results += [pscustomobject]@{ name = $s.Name; cmd = $s.Cmd; result = 'missing-tool'; exitCode = $null }
         Write-State 'running' $results
         continue
     }
-    Add-Content $log "`n=== $($s.Name) ($($s.Cmd)) ===" -Encoding utf8
+    Add-Log "`n=== $($s.Name) ($($s.Cmd)) ==="
     Push-Location $s.Dir
-    cmd /c "$($s.Cmd) 2>&1" | ForEach-Object { $_ | Add-Content $log -Encoding utf8; $_ }
+    cmd /c "$($s.Cmd) 2>&1" | ForEach-Object { Add-Log "$_"; $_ }
     $code = $LASTEXITCODE
     Pop-Location
     $res = 'failed'
@@ -92,7 +102,7 @@ foreach ($s in $suites) {
 
 Write-Host "`n=== SUMMARY ===" -ForegroundColor Yellow
 $table = $results | Format-Table name, result, exitCode -AutoSize | Out-String
-Add-Content $log $table -Encoding utf8
+Add-Log $table
 Write-Host $table
 Write-State 'done' $results
 
