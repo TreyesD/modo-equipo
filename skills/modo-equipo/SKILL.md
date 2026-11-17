@@ -252,6 +252,11 @@ Session names: `<project> - coordinador`, `<project> - desarrollo`, `<project> -
   - To a pricier model: start a fresh session on it with a brief that points at the feature document, then archive the old session once its work is committed or backed up. The new session replaces the old one in the lineup; it never adds to it.
   - Switch an existing session's model only when its history is short (rough guide: under ~50k tokens) or its very next turn needs that exact history; a move to a cheaper model can be a switch.
   - If the session-start tool cannot pick a pricier model than the coordinator's, start the session with a minimal "read the skill, reply ready, wait" brief, set its model, then send the task.
+- **A full session is cleared, not replaced, and never stops the work** (same model): a long history costs on every turn, so reset it, but without waiting on the user.
+  - At about 75 % context the session finishes its step at a clean point (work committed), appends a short hand-over note to a file next to the feature document (done, next, branch and commit), reports "handover ready" and ends its turn. It never asks "continue here or fresh?".
+  - The coordinator clears that idle session (the app's clear-session tool, the same as `/clear`) and sends a restart brief: read the skill, the hand-over note and the feature document, then continue. Clearing works without a user turn; starting a new session may need one, so prefer clearing.
+  - If clearing is not available, the session keeps working and lets auto-compact run; the coordinator replaces it on the user's next message without asking.
+  - Only real product decisions and new live measurements go to the user, never session housekeeping.
 - Mark deliberate shortcuts with a `shortcut:` comment so debt stays visible.
 - Do not re-run tests or measurements already done; check logs first.
 - Inter-session language: messages between sessions, briefs and `## Log` notes use terse telegraphic English (short phrases, no pleasantries, `path:line` evidence). Never translate or compress the user's verbatim quotes (`S#`, `L1`), code, paths or error text. Replies to the user stay in the user's language; this rule covers only session-to-session text.
