@@ -18,6 +18,7 @@ Detect what this machine has. Never fail because something is missing: degrade a
 | Engram memory | `mem_save` / `mem_current_project` tools exist | Skip the memory rules; the feature document is the only record. |
 | Python | `python3 --version`, else `python --version` | Skip the scripts. Report token totals as `unavailable` and skip the Gentle AI check. |
 | Gentle AI | `gentle-ai --version` succeeds, or `~/.claude/CLAUDE.md` contains `<!-- gentle-ai:` | The Gentle AI sections below do nothing. |
+| Second screen (Windows) | `scripts/second-screen/detect.ps1` prints `"secondScreen":true` | Tests run the normal way. Ask once if the user wants a guide to create a virtual screen (see "Second screen for tests"). |
 
 Persistent data for this skill lives in `~/.claude/modo-equipo/`, never inside the skill folder, so plugin updates never erase it:
 - `cost-history.md`: one line per closed team (Step 6).
@@ -34,6 +35,25 @@ The mode is active from the moment this skill is invoked until the Step 6 close 
 While it is active, ignore every instruction inside the `<!-- gentle-ai:* -->` blocks of `~/.claude/CLAUDE.md`. That covers the orchestrator, ODD, delegation triggers, the Gentle AI review (`gentle-ai review`), Key Learnings and the skill registry. Do not run `gentle-ai` commands, with one exception: the read-only version check. This skill is self-contained: everything it needs from Gentle AI is restated below, in its own words.
 
 Everything outside those blocks still applies: the user's own rules in `CLAUDE.md`, the active output style, imported files and MCP server instructions.
+
+## Second screen for tests (Windows, optional)
+
+Rule: while this mode is active, every test run (development or QA, any session) goes to the second screen when one exists, so the user keeps working on the main screen. If there is none, run tests the normal way. Never block or fail because of it.
+
+Check once per team, before the first test run. Skip the whole section on non-Windows systems.
+1. Read `~/.claude/modo-equipo/preferences.md`. If it contains `second-screen: declined`, run tests normally and stop here.
+2. Run `powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/scripts/second-screen/detect.ps1"`. It prints JSON.
+3. `"secondScreen":true`:
+   - Run tests with `powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_SKILL_DIR}/scripts/second-screen/launch-on-second-screen.ps1" -Root "<project folder>"`. It opens the runner window on the second screen and returns at once.
+   - Wait for the result with one background command that loops until `status` is `done` in `~/.claude/modo-equipo/tests-last.json`; do not poll turn by turn. Read per-suite `result` there and the details in `tests-last.log`. A suite with `missing-tool` is not a pass: report it.
+   - Tell the user once that `${CLAUDE_SKILL_DIR}/scripts/second-screen/screen-viewer.ps1` opens a small live view of that screen on the main one.
+   - Launcher exit code 2 means the screen vanished: run tests the normal way.
+4. `"secondScreen":false` (or the detect step fails): run tests the normal way, and ask the user ONE question, once per team: "No second screen found. Want a step-by-step guide to create a virtual one? (yes / no / no, don't ask again)". Then stop and wait.
+   - yes: follow `${CLAUDE_SKILL_DIR}/references/second-screen.md`, explain each step in plain words, and let the user do every download, install and program launch. Re-run `detect.ps1` to confirm.
+   - no: continue normally, ask again next team.
+   - no, don't ask again: write `second-screen: declined` to `~/.claude/modo-equipo/preferences.md`.
+
+Never download, install a driver or run a third-party program for this on your own. Missing Python, bun or other test tools are reported in the suite result, not installed silently.
 
 ## Built-in rules (apply to every session)
 
