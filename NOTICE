@@ -1,0 +1,27 @@
+modo-equipo
+Copyright (c) TreyesD. Licensed under the MIT License (see LICENSE).
+
+This project builds on ideas, workflow rules and conventions from the
+following open-source projects. Where modo-equipo restates their rules,
+it does so in its own words; any text copied verbatim from them in the
+future keeps the notice below.
+
+Gentle AI
+  https://github.com/Gentleman-Programming/gentle-ai
+  Copyright (c) 2025 Gentleman Programming
+  Licensed under the MIT License.
+  Used for: the feature-document workflow (Organic Driven Development),
+  test-first rules, risk line and high-risk item list, delegation rules,
+  and the design of its code review engine (planned reimplementation,
+  see docs/plan-integracion-gentle.md).
+
+  Some skills distributed with Gentle AI (for example judgment-day) are
+  marked Apache-2.0. If any of their text is copied, keep their license
+  and attribution notice alongside it, as Apache-2.0 requires.
+
+Engram
+  https://github.com/Gentleman-Programming/engram
+  Copyright (c) Gentleman Programming
+  Licensed under the MIT License.
+  Used for: the persistent-memory conventions modo-equipo follows when
+  Engram is installed. modo-equipo does not include Engram code.

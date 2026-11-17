@@ -79,6 +79,10 @@ Cada cambio se prueba solo en GitHub en **macOS (Apple Silicon), Linux y Windows
 python -m unittest discover -s tests -v
 ```
 
+## Créditos
+
+modo-equipo toma ideas y reglas de trabajo de [Gentle AI](https://github.com/Gentleman-Programming/gentle-ai) y sigue las convenciones de memoria de [Engram](https://github.com/Gentleman-Programming/engram), ambos de Gentleman Programming y con licencia MIT. El detalle está en [`NOTICE`](NOTICE).
+
 ## Licencia
 
 MIT
