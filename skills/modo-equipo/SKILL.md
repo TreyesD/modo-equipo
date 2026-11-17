@@ -248,6 +248,10 @@ Session names: `<project> - coordinador`, `<project> - desarrollo`, `<project> -
 - Decision ladder before acting: does it need to exist? already in the codebase? stdlib or native feature? installed dependency? only then write new code. Read the code a change touches before editing it.
 - Return summaries of at most ~2k tokens with `path:line` evidence; never dump files into the coordinator.
 - Route mechanical, read-only work to a cheaper model; keep the strongest model for design and the single writer.
+- **Escalating to a more capable model saves tokens with a fresh session** (any model, any time a task needs more capability than the current one): every turn re-reads the session's whole history at its model's price, and a model change starts on a cold prompt cache (caches are per model). A long history re-read at a pricier rate costs more than starting over from the feature document. So:
+  - To a pricier model: start a fresh session on it with a brief that points at the feature document, then archive the old session once its work is committed or backed up. The new session replaces the old one in the lineup; it never adds to it.
+  - Switch an existing session's model only when its history is short (rough guide: under ~50k tokens) or its very next turn needs that exact history; a move to a cheaper model can be a switch.
+  - If the session-start tool cannot pick a pricier model than the coordinator's, start the session with a minimal "read the skill, reply ready, wait" brief, set its model, then send the task.
 - Mark deliberate shortcuts with a `shortcut:` comment so debt stays visible.
 - Do not re-run tests or measurements already done; check logs first.
 - Inter-session language: messages between sessions, briefs and `## Log` notes use terse telegraphic English (short phrases, no pleasantries, `path:line` evidence). Never translate or compress the user's verbatim quotes (`S#`, `L1`), code, paths or error text. Replies to the user stay in the user's language; this rule covers only session-to-session text.
