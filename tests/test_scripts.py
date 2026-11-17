@@ -434,5 +434,29 @@ class LaunchOffscreenLive(unittest.TestCase):
             subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
 
 
+class ParsecVirtualDisplay(unittest.TestCase):
+    """Direct driver control used by open-viewer.ps1 (no ParsecVDisplay window)."""
+    DIR = os.path.join(SCRIPTS, "second-screen")
+
+    def test_viewer_files_are_installed_together(self):
+        with open(os.path.join(self.DIR, "install-desktop-shortcut.ps1"), encoding="utf-8") as f:
+            install = f.read()
+        with open(os.path.join(self.DIR, "open-viewer.ps1"), encoding="utf-8") as f:
+            launcher = f.read()
+        self.assertIn("parsec-vdd.ps1", install)   # the shortcut copy must include the module
+        self.assertIn("parsec-vdd.ps1", launcher)
+        self.assertIn("Dispose()", launcher)        # the screen is removed when the viewer closes
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows PowerShell only")
+    def test_self_test_checks_ioctls_without_adding_a_display(self):
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+             os.path.join(self.DIR, "parsec-vdd.ps1"), "-SelfTest"],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("All checks passed", out.stdout)
+        self.assertNotIn("FAIL", out.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

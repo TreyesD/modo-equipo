@@ -45,6 +45,7 @@ Si nada de eso sirve, Claude tiene que avisarte antes, decirte cuánto va a tard
 - **Silenciar** apaga el sonido de las apps que están en la segunda pantalla (Windows no permite silenciar una pantalla). Si la misma app también está en tu pantalla, se silencia entera.
 - **Pantalla completa**: el visor ocupa toda tu pantalla, la barra se esconde sola y aparece arriba al salir del modo directo (borde o **Ctrl+Alt+Q**). "Siempre encima" solo existe en la ventana pequeña.
 - Funciona con pantallas de **escalas distintas** (por ejemplo 125% y 100%).
+- El acceso directo del visor crea la pantalla virtual **sin abrir ninguna ventana de ParsecVDisplay**: habla directo con el driver de Parsec ya instalado. La pantalla existe mientras el visor está abierto y desaparece al cerrarlo. Si el driver no está, avisa y ofrece usar la app ParsecVDisplay como antes.
 
 ### 4. Control virtual para emuladores
 

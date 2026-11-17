@@ -148,19 +148,31 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 
 ## second-screen/open-viewer.ps1
 
-**En simple:** un clic que deja todo listo: si no hay segunda pantalla, inicia ParsecVDisplay, pulsa "ADD DISPLAY" y abre el visor.
+**En simple:** un clic que deja todo listo: si no hay segunda pantalla, la crea en silencio hablando directo con el driver de Parsec (sin abrir la app ParsecVDisplay), abre el visor y quita la pantalla al cerrarlo.
 
 **Contrato:**
 - Uso: `powershell -NoProfile -ExecutionPolicy Bypass -STA -File scripts/second-screen/open-viewer.ps1`. Lo normal es usarlo desde el acceso directo (`install-desktop-shortcut.ps1`).
 - Con segunda pantalla ya presente, solo abre `screen-viewer.ps1` (de la misma carpeta).
-- Sin ella, localiza `ParsecVDisplay.exe` (variable `PARSECVDISPLAY_EXE`, archivo `~/.claude/modo-equipo/parsecvdisplay-path.txt`, proceso en ejecución o carpetas habituales), pulsa el botón por UI Automation (sin mover el mouse) y espera hasta 20 s a que Windows reporte la pantalla.
-- Si no encuentra `ParsecVDisplay.exe` (y no hay segunda pantalla), pregunta al dueño: elegir el .exe con un selector de archivos (la ruta queda guardada), abrir el visor igual o no hacer nada. Nunca busca en el disco ni descarga.
+- Sin ella, abre el driver Parsec Virtual Display con `parsec-vdd.ps1`, agrega una pantalla y espera hasta 15 s a que Windows la reporte. Mientras el visor está abierto, un hilo envía al driver la señal de vida cada 50 ms (el driver pide recibirla al menos cada 100 ms y quita las pantallas cuando se corta). Al cerrar el visor quita esa pantalla; nunca quita pantallas que no agregó.
+- `-Smoke`: chequeo de desarrollo. Agrega una pantalla por el driver aunque ya haya otra, abre el visor en su modo `-Smoke` unos segundos e imprime cuántas pantallas había antes y después de cerrar.
+- Plan de respaldo, solo si el driver no se puede usar (no instalado, sin acceso o sin respuesta): localiza `ParsecVDisplay.exe` (variable `PARSECVDISPLAY_EXE`, archivo `~/.claude/modo-equipo/parsecvdisplay-path.txt`, proceso en ejecución o carpetas habituales), pulsa el botón por UI Automation (sin mover el mouse) y espera hasta 20 s a que Windows reporte la pantalla.
+- Si el driver falla y no encuentra `ParsecVDisplay.exe`, muestra el motivo del fallo del driver, indica la guía de instalación (`references/second-screen.md`, opción B) y pregunta al dueño: elegir el .exe con un selector de archivos (la ruta queda guardada), abrir el visor igual o no hacer nada. Nunca busca en el disco ni descarga.
 - Si algo falla muestra un mensaje de error; nunca falla en silencio.
-- No descarga ni instala nada: solo inicia un ParsecVDisplay que el usuario ya tiene, y solo cuando el usuario hace clic.
+- No descarga ni instala nada: solo usa el driver o el ParsecVDisplay que el usuario ya tiene, y solo cuando el usuario hace clic.
+
+## second-screen/parsec-vdd.ps1
+
+**En simple:** el control remoto del driver de pantalla virtual de Parsec: agrega y quita pantallas sin la app ParsecVDisplay.
+
+**Contrato:**
+- Se carga con `. .\parsec-vdd.ps1` y define el tipo `[ModoEquipo.ParsecVdd]`: `Open()`, `AddDisplay()` (devuelve el índice), `RemoveDisplay(i)`, `Version()`, `MonitorCount()` y `Dispose()` (quita las pantallas que agregó ese objeto, detiene la señal de vida y cierra el driver).
+- Busca la interfaz del driver con SetupAPI (GUID `{00b41627-04c4-429e-a26e-0265cf50c8fa}`) y le envía los IOCTL de `parsec-vdd.h` del proyecto nomi-san/parsec-vdd (licencia BSD de 2 cláusulas, ver `NOTICE`). No necesita administrador.
+- Si el proceso muere sin `Dispose()`, la señal de vida se corta y el driver quita la pantalla solo. Si la app ParsecVDisplay está abierta al mismo tiempo, su propia señal de vida puede mantenerla unos segundos más.
+- `-SelfTest`: comprueba los códigos IOCTL contra la fórmula `CTL_CODE`, el formato del índice y el intervalo de la señal; si el driver está, informa su versión. Nunca agrega pantallas (código 0 = pasa).
 
 ## second-screen/install-desktop-shortcut.ps1
 
 **En simple:** crea el icono "Visor segunda pantalla" en el Escritorio.
 
 **Contrato:**
-- Ejecutarlo a mano, una vez. Copia `open-viewer.ps1` y `screen-viewer.ps1` a `~/.claude/modo-equipo/viewer/` para que el acceso directo siga funcionando tras actualizar el plugin; volver a ejecutarlo actualiza esas copias.
+- Ejecutarlo a mano, una vez. Copia `open-viewer.ps1`, `screen-viewer.ps1` y `parsec-vdd.ps1` a `~/.claude/modo-equipo/viewer/` para que el acceso directo siga funcionando tras actualizar el plugin; volver a ejecutarlo actualiza esas copias.

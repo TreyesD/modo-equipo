@@ -20,7 +20,8 @@ This is a small tray app that adds and removes virtual displays. It needs the Pa
 6. Verify: run `scripts/second-screen/detect.ps1`; it must print `"secondScreen":true`.
 
 Notes:
-- The virtual display exists only while `ParsecVDisplay.exe` runs. Close it and the display disappears; the skill then falls back to the normal test flow.
+- Only the driver (steps 2-3) is required by the skill: `open-viewer.ps1` talks to it directly and needs no `ParsecVDisplay.exe` window. The app is kept as a fallback and for adding displays by hand.
+- A virtual display lives only while something keeps pinging the driver (the viewer launcher or `ParsecVDisplay.exe`). When that stops, the display disappears; the skill then falls back to the normal test flow.
 - The app can start with Windows (setting inside the app).
 
 ## Option C - Virtual Display Driver (alternative, driver-level)
@@ -34,7 +35,8 @@ Project: https://github.com/VirtualDrivers/Virtual-Display-Driver (assets named 
 - `scripts/second-screen/launch_offscreen.py -- <exe> [args...]`: starts any windowed program so none of its windows is ever shown on the main screen (minimized + suspended start, WinEvent hook, placement before the first visible frame, transparent-move guard). Prints one JSON line; exit 0 placed, 1 launch failed, 2 usage, 3 not Windows, 4 no second screen (started normally), 5 a window stayed on the main screen. Apps that restore their own saved geometry may need an app-specific pre-set (for example Dolphin's `Qt.ini` window geometry).
 - `scripts/second-screen/run-tests.ps1`: detects suites (package.json `test` script, pytest `tests/`, `go.mod`, `Cargo.toml`), runs them in order, writes `~/.claude/modo-equipo/tests-last.json` (`status` running|done, result per suite) and `tests-last.log`. Override detection with `<project>/.modo-equipo-tests.json`: `[{"name":"api","dir":"services/api","cmd":"npm test"}]`.
 - `scripts/second-screen/screen-viewer.ps1`: borderless window on the main screen that mirrors the second one live through the Magnification API (GPU, ~60 fps, real cursor). Moving over the image drives the real cursor there; a floating toolbar offers always-on-top (small window only), pointer, mute, full screen, hide, minimize and close.
-- `scripts/second-screen/open-viewer.ps1`: one-click entry point. Adds the ParsecVDisplay virtual screen when there is none (starts the already-installed `ParsecVDisplay.exe` and presses ADD DISPLAY), then opens the viewer. `install-desktop-shortcut.ps1` creates a desktop shortcut for it; the user runs that once.
+- `scripts/second-screen/open-viewer.ps1`: one-click entry point. When there is no second screen it adds one silently through the installed Parsec Virtual Display Driver (`parsec-vdd.ps1`, no app window), opens the viewer, and removes that screen when the viewer closes. Only if the driver cannot be used does it fall back to starting `ParsecVDisplay.exe` and pressing ADD DISPLAY, with a message that says why.
+- `scripts/second-screen/parsec-vdd.ps1`: direct driver control (SetupAPI interface lookup, add/remove/keep-alive IOCTLs from nomi-san/parsec-vdd `parsec-vdd.h`, BSD-2-Clause, credited in NOTICE). Dot-source it for `[ModoEquipo.ParsecVdd]`; `-SelfTest` checks the constants and never adds a display. `install-desktop-shortcut.ps1` creates a desktop shortcut for it; the user runs that once.
 
 ## Troubleshooting
 
