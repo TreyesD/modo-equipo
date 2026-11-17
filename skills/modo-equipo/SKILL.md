@@ -225,6 +225,14 @@ Task status uses exactly one of these values. Only the coordinator moves a task 
 
 Merge gate: each task names the exact checks that must pass before `merged`, for example "focused tests pass, QA PASS on S3-S4". A task cannot be `ready` without acceptance criteria and a merge gate. The coordinator moves it to `merged` only after logging observed evidence that every gate check passed.
 
+Merge and publish flow (coordinator):
+1. QA PASS arrives: check any caveat QA flags against the source yourself (one look, inline) before merging.
+2. Merge with `--no-ff`, then a Sonnet subagent runs the post-merge checks (suite, generators reproduce committed data, no game or vendor assets tracked, no new stray files) and returns the useful-summary shape.
+3. On READY, push right away; do not wait for the user. The coordinator pushes only `main` of the team's repos, never with force. Auto mode can block a plain push: at the first block, ask the user once to allow that exact command (for example `Bash(git -C "<repo>" push origin main)` in `~/.claude/settings.json`) and from then on always use that exact spelling.
+4. Log the merge, the check numbers and the push in the feature document.
+
+A live-measurement OK from the user covers only the runs it names; a new kind of run (another mode, another stage) needs a new OK.
+
 | Status | Meaning |
 |---|---|
 | `backlog` | Known, not ready: missing spec, data or a decision |
@@ -278,6 +286,10 @@ Session names: `<project> - coordinador`, `<project> - desarrollo`, `<project> -
   - The coordinator clears that idle session (the app's clear-session tool, the same as `/clear`) and sends a restart brief: read the skill, the hand-over note and the feature document, then continue. Clearing works without a user turn; starting a new session may need one, so prefer clearing.
   - If clearing is not available, the session keeps working and lets auto-compact run; the coordinator replaces it on the user's next message without asking.
   - Only real product decisions and new live measurements go to the user, never session housekeeping.
+  - Do not wait for 75 % when a session's next task is blocked or it already passed ~55 %: ask for the hand-over at the next clean point; a cleared idle session costs nothing.
+- **Research and gates in parallel**: when QA has a gate queue and research work (decoding, live measurements) at the same time, the coordinator starts a 4th research session on the strongest model for the research items instead of switching QA's model; QA stays on gates.
+- **Commands handed to the user** must run as-is in the user's shell: on Windows PowerShell a quoted program path needs the call operator (`& "C:/path/app.exe" --flag`). When the user wants something launched, prefer launching it yourself in a terminal tab.
+- **User feedback from playing or using the product** goes into the feature document's Log verbatim, as a backlog task with an owner, even when the user says "tenlo como nota".
 - Mark deliberate shortcuts with a `shortcut:` comment so debt stays visible.
 - Do not re-run tests or measurements already done; check logs first.
 - Inter-session language: messages between sessions, briefs and `## Log` notes use terse telegraphic English (short phrases, no pleasantries, `path:line` evidence). Never translate or compress the user's verbatim quotes (`S#`, `L1`), code, paths or error text. Replies to the user stay in the user's language; this rule covers only session-to-session text.
