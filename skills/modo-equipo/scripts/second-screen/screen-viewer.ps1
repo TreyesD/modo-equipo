@@ -405,8 +405,13 @@ public static class SvMag {
 [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class SvMMDeviceEnumerator { }
 [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface ISvMMDeviceEnumerator {
-    [PreserveSig] int EnumAudioEndpoints(int flow, int mask, out IntPtr devices);
+    [PreserveSig] int EnumAudioEndpoints(int flow, int mask, out ISvMMDeviceCollection devices);
     [PreserveSig] int GetDefaultAudioEndpoint(int flow, int role, out ISvMMDevice device);
+}
+[ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface ISvMMDeviceCollection {
+    [PreserveSig] int GetCount(out int n);
+    [PreserveSig] int Item(int i, out ISvMMDevice device);
 }
 [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface ISvMMDevice {
@@ -440,12 +445,13 @@ interface ISvAudioSessionControl2 {
     [PreserveSig] int IsSystemSoundsSession();
     [PreserveSig] int SetDuckingPreference(bool optOut);
 }
-[ComImport, Guid("87CE5498-68D6-44E5-9215-6F5E9AAF8B6F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+// IID from audioclient.h (ISimpleAudioVolume). BOOL arguments are 32-bit ints, not .NET bool.
+[ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface ISvSimpleAudioVolume {
     [PreserveSig] int SetMasterVolume(float level, ref Guid g);
     [PreserveSig] int GetMasterVolume(out float level);
-    [PreserveSig] int SetMute(bool mute, ref Guid g);
-    [PreserveSig] int GetMute(out bool mute);
+    [PreserveSig] int SetMute(int mute, ref Guid g);
+    [PreserveSig] int GetMute(out int mute);
 }
 
 // Mute the apps shown on the second screen (Windows has no per-screen mute).
@@ -480,36 +486,79 @@ public static class SvAudio {
         return names.ToArray();
     }
 
-    // Set mute on every audio session of the default output whose process name is in names.
-    // Returns how many sessions were changed.
+    // Session selection: a session belongs to an app on the second screen when its process has
+    // the same name as one of that screen's window processes (exact name, any case). Matching by
+    // name covers apps whose sound comes from a helper process with the same name (Chrome's
+    // audio service), at the cost of muting that app's other windows too.
+    public static bool Wanted(string processName, string[] names) {
+        if (string.IsNullOrEmpty(processName) || names == null) return false;
+        foreach (string want in names)
+            if (string.Equals(want, processName, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    // Set mute on every audio session, on every active output device, whose process is wanted.
+    // Returns how many sessions were changed; LastError holds the last per-session failure.
+    public static string LastError = "";
+    public static Guid VolumeIid { get { return typeof(ISvSimpleAudioVolume).GUID; } }
     public static int SetMute(string[] names, bool mute) {
+        LastError = "";
         ISvMMDeviceEnumerator en = (ISvMMDeviceEnumerator)(new SvMMDeviceEnumerator());
-        ISvMMDevice dev;
-        Marshal.ThrowExceptionForHR(en.GetDefaultAudioEndpoint(0, 1, out dev));
-        Guid iid = typeof(ISvAudioSessionManager2).GUID;
-        object o;
-        Marshal.ThrowExceptionForHR(dev.Activate(ref iid, 23, IntPtr.Zero, out o));
-        ISvAudioSessionEnumerator se;
-        Marshal.ThrowExceptionForHR(((ISvAudioSessionManager2)o).GetSessionEnumerator(out se));
-        int n, changed = 0;
-        se.GetCount(out n);
-        for (int i = 0; i < n; i++) {
-            ISvAudioSessionControl2 c;
-            if (se.GetSession(i, out c) != 0 || c == null) continue;
-            uint pid; c.GetProcessId(out pid);
-            if (pid == 0) continue;
-            string pn = "";
-            try { pn = Process.GetProcessById((int)pid).ProcessName; } catch { continue; }
-            foreach (string want in names) {
-                if (string.Equals(want, pn, StringComparison.OrdinalIgnoreCase)) {
+        ISvMMDeviceCollection devices;
+        Marshal.ThrowExceptionForHR(en.EnumAudioEndpoints(0, 1, out devices));   // render, DEVICE_STATE_ACTIVE
+        int nd, changed = 0;
+        devices.GetCount(out nd);
+        for (int d = 0; d < nd; d++) {
+            ISvMMDevice dev;
+            if (devices.Item(d, out dev) != 0 || dev == null) continue;
+            Guid iid = typeof(ISvAudioSessionManager2).GUID;
+            object o;
+            if (dev.Activate(ref iid, 23, IntPtr.Zero, out o) != 0) continue;
+            ISvAudioSessionEnumerator se;
+            if (((ISvAudioSessionManager2)o).GetSessionEnumerator(out se) != 0) continue;
+            int n;
+            se.GetCount(out n);
+            for (int i = 0; i < n; i++) {
+                ISvAudioSessionControl2 c;
+                if (se.GetSession(i, out c) != 0 || c == null) continue;
+                uint pid; c.GetProcessId(out pid);
+                if (pid == 0) continue;
+                string pn = "";
+                try { pn = Process.GetProcessById((int)pid).ProcessName; } catch { continue; }
+                if (!Wanted(pn, names)) continue;
+                try {
                     Guid g = Guid.Empty;
-                    ((ISvSimpleAudioVolume)c).SetMute(mute, ref g);
-                    changed++;
-                    break;
-                }
+                    int hr = ((ISvSimpleAudioVolume)c).SetMute(mute ? 1 : 0, ref g);
+                    if (hr == 0) changed++; else LastError = pn + ": 0x" + hr.ToString("X8");
+                } catch (Exception ex) { LastError = pn + ": " + ex.Message; }
             }
         }
         return changed;
+    }
+
+    // Mute state of the sessions of the given process names (for checks): "name=0/1" pairs.
+    public static string[] MuteStates(string[] names) {
+        List<string> r = new List<string>();
+        ISvMMDeviceEnumerator en = (ISvMMDeviceEnumerator)(new SvMMDeviceEnumerator());
+        ISvMMDeviceCollection devices;
+        if (en.EnumAudioEndpoints(0, 1, out devices) != 0) return r.ToArray();
+        int nd; devices.GetCount(out nd);
+        for (int d = 0; d < nd; d++) {
+            ISvMMDevice dev; if (devices.Item(d, out dev) != 0) continue;
+            Guid iid = typeof(ISvAudioSessionManager2).GUID; object o;
+            if (dev.Activate(ref iid, 23, IntPtr.Zero, out o) != 0) continue;
+            ISvAudioSessionEnumerator se; if (((ISvAudioSessionManager2)o).GetSessionEnumerator(out se) != 0) continue;
+            int n; se.GetCount(out n);
+            for (int i = 0; i < n; i++) {
+                ISvAudioSessionControl2 c; if (se.GetSession(i, out c) != 0 || c == null) continue;
+                uint pid; c.GetProcessId(out pid); if (pid == 0) continue;
+                string pn; try { pn = Process.GetProcessById((int)pid).ProcessName; } catch { continue; }
+                if (!Wanted(pn, names)) continue;
+                int m = -1; try { ((ISvSimpleAudioVolume)c).GetMute(out m); } catch { }
+                r.Add(pn + "=" + m);
+            }
+        }
+        return r.ToArray();
     }
 }
 
@@ -737,6 +786,15 @@ if ($SelfTest) {
     Check ($null -eq $hr) "home: virtual between real screens -> no lock"
     $hr = Get-HomeRect @((Scr 0 0 1920 1080 $false), (Scr 1920 0 1920 1080 $false))
     Check ($null -eq $hr) "home: no virtual screen -> no lock"
+    # Mute: which audio sessions belong to the apps on the second screen.
+    $onSecond = [string[]]@('chrome', 'Dolphin')
+    Check ([SvAudio]::Wanted('chrome', $onSecond)) "mute: chrome audio service matches a chrome window"
+    Check ([SvAudio]::Wanted('DOLPHIN', $onSecond)) "mute: name match ignores case"
+    Check (-not [SvAudio]::Wanted('chromedriver', $onSecond)) "mute: no partial-name match"
+    Check (-not [SvAudio]::Wanted('Spotify', $onSecond)) "mute: other apps untouched"
+    Check (-not [SvAudio]::Wanted('chrome', [string[]]@())) "mute: nothing on the second screen -> nothing muted"
+    # The interface id must be ISimpleAudioVolume's (a wrong one made every mute fail silently).
+    Check ([SvAudio]::VolumeIid -eq [Guid]'87ce5498-68d6-44e5-9215-6da47ef883d8') "mute: ISimpleAudioVolume IID"
     Write-Output "selftest: $($total - $fail)/$total passed"
     exit $fail
 }
@@ -1055,11 +1113,16 @@ function Switch-Mute {
             $b = $s.Bounds
             $names = [SvAudio]::ProcessNamesOn($b.X, $b.Y, $b.Width, $b.Height, $PID)
             $n = [SvAudio]::SetMute($names, $true)
-            Write-ViewerLog "muted sessions=$n apps=$($names -join ',')"
+            Write-ViewerLog "muted sessions=$n apps=$($names -join ',') error=$([SvAudio]::LastError)"
             if ($n -gt 0) { $script:muted = @($names) }
+            elseif ([SvAudio]::LastError) { $bar.ShowTip("Could not mute: $([SvAudio]::LastError)", 'mute') }
             else { $bar.ShowTip("No sound found from the apps on the second screen", 'mute') }
         }
-    } catch { Write-ViewerLog "mute failed: $($_.Exception.Message)" }
+    } catch {
+        # Never fail silently: the owner sees why the button did nothing.
+        Write-ViewerLog "mute failed: $($_.Exception.Message)"
+        $bar.ShowTip("Could not mute: $($_.Exception.Message)", 'mute')
+    }
     Update-Glyphs
 }
 
