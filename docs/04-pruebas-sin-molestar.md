@@ -39,6 +39,7 @@ Si nada de eso sirve, Claude tiene que avisarte antes, decirte cuánto va a tard
 - **Doble clic** funciona: dos clics seguidos llegan como doble clic.
 - **Teclado**: al hacer clic en una ventana de la segunda pantalla, esa ventana queda activa y lo que escribes va a ella. Para volver, haz clic en tu pantalla.
 - **Para salir**: empuja el mouse más allá de cualquier borde de la imagen, o aprieta **Ctrl+Alt+Q**.
+- **El mouse no se escapa a la pantalla virtual**: mientras el visor está abierto, tu cursor se queda en tu pantalla aunque lo lleves al borde. Solo cruza si mantienes un botón apretado (por ejemplo, para arrastrar una ventana hacia allá) o a través de la imagen del visor. Al soltar el botón, el cursor vuelve a tu pantalla. El botón del candado en la barra lo apaga, y se libera solo al cerrar el visor (también si se cierra por un error).
 - La imagen la dibuja la tarjeta gráfica (Magnification API de Windows): unos **60 cuadros por segundo** y el **cursor real** de la segunda pantalla. Si una app dibuja su propio puntero (por ejemplo un juego), apaga el botón de puntero para no ver dos.
 - La ventana **no tiene barra de título de Windows**: arrastra la franja de arriba para moverla y sus bordes para cambiar el tamaño.
 - **Barra de opciones** flotante (por fuera de la ventana, arriba; abajo si no hay espacio): mantener encima de todo, puntero, silenciar, pantalla completa, ocultar la barra, minimizar y cerrar. Si la ocultas, vuelve al pasar el mouse por la franja de arriba.

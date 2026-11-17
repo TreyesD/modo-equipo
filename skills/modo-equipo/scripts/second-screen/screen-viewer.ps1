@@ -7,6 +7,9 @@ param(
 # Moving the pointer over the image puts the real cursor on the second screen (direct mode):
 # clicks, drags, the wheel and typing are ordinary native input there. Push past any edge of the
 # image, or press Ctrl+Alt+Q, to come back.
+# While a virtual screen exists the real cursor is kept on the main screen(s): plain movement
+# stops at the edge; holding a mouse button (dragging a window) or direct mode can still cross.
+# The lock is released when the viewer closes and can be turned off from the toolbar.
 # The picture comes from the Windows Magnification API (GPU, ~60 fps, real cursor shape); when it
 # is not available the viewer falls back to a GDI screen copy.
 # The window has no Windows title bar: a thin strip on top moves it, its edges resize it, and a
@@ -215,6 +218,48 @@ public static class SvAudio {
     }
 }
 
+// Keeps the real cursor on the main screen(s) while a virtual screen exists: plain movement
+// stops at the edge, while a held button (dragging a window) or the viewer's direct mode can
+// still cross. ClipCursor is system-wide and other programs (or Windows) may change or reset
+// it, so the viewer re-applies it only when nobody else holds a clip.
+public static class SvClip {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct DISPLAY_DEVICE {
+        public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+        public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+    }
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevices(string device, uint i, ref DISPLAY_DEVICE d, uint flags);
+    [DllImport("user32.dll")] static extern bool ClipCursor(ref SvRect r);
+    [DllImport("user32.dll")] static extern bool ClipCursor(IntPtr r);
+    [DllImport("user32.dll")] static extern bool GetClipCursor(out SvRect r);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+
+    // Adapter description of a screen (for example "Parsec Virtual Display Adapter").
+    public static string AdapterOf(string screenDevice) {
+        DISPLAY_DEVICE d = new DISPLAY_DEVICE(); d.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+        for (uint i = 0; EnumDisplayDevices(null, i, ref d, 0); i++) {
+            if (string.Equals(d.DeviceName, screenDevice, StringComparison.OrdinalIgnoreCase)) return d.DeviceString;
+            d.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+        }
+        return "";
+    }
+    public static bool IsVirtual(string screenDevice) {
+        string a = AdapterOf(screenDevice);
+        return a.IndexOf("Parsec", StringComparison.OrdinalIgnoreCase) >= 0 || a.IndexOf("Virtual Display", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+    // Physical buttons (GetAsyncKeyState reads the device, so swapped buttons do not matter here).
+    public static bool AnyButtonDown() {
+        return (GetAsyncKeyState(0x01) & 0x8000) != 0 || (GetAsyncKeyState(0x02) & 0x8000) != 0 || (GetAsyncKeyState(0x04) & 0x8000) != 0;
+    }
+    public static Rectangle Current() { SvRect r; GetClipCursor(out r); return Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom); }
+    public static void Set(Rectangle b) { SvRect r; r.Left = b.Left; r.Top = b.Top; r.Right = b.Right; r.Bottom = b.Bottom; ClipCursor(ref r); }
+    public static void Release() { ClipCursor(IntPtr.Zero); }
+}
+
 // Hidden window that receives raw mouse motion (still reported when Windows holds the cursor
 // at the edge of the desktop) and the global exit hotkey (Ctrl+Alt+Q).
 public class SvInput : NativeWindow {
@@ -299,6 +344,24 @@ function Get-LetterBox([double]$boxW, [double]$boxH, $bounds) {
     return [pscustomobject]@{ X = [int][Math]::Floor(($boxW - $w) / 2); Y = [int][Math]::Floor(($boxH - $h) / 2); W = $w; H = $h; Scale = $scale }
 }
 
+# Area the cursor is kept in while a virtual screen exists: the bounding box of the screens that
+# are not virtual. $null (no lock) when there is no virtual screen, or when that box would also
+# cover a virtual screen (a rectangle cannot express the layout).
+function Get-HomeRect($screens) {
+    $virtual = @($screens | Where-Object { $_.Virtual })
+    $real = @($screens | Where-Object { -not $_.Virtual })
+    if ($virtual.Count -eq 0 -or $real.Count -eq 0) { return $null }
+    $l = ($real | ForEach-Object { $_.Bounds.X } | Measure-Object -Minimum).Minimum
+    $t = ($real | ForEach-Object { $_.Bounds.Y } | Measure-Object -Minimum).Minimum
+    $r = ($real | ForEach-Object { $_.Bounds.X + $_.Bounds.Width } | Measure-Object -Maximum).Maximum
+    $b = ($real | ForEach-Object { $_.Bounds.Y + $_.Bounds.Height } | Measure-Object -Maximum).Maximum
+    foreach ($v in $virtual) {
+        $vb = $v.Bounds
+        if ($vb.X -lt $r -and $vb.X + $vb.Width -gt $l -and $vb.Y -lt $b -and $vb.Y + $vb.Height -gt $t) { return $null }
+    }
+    return [pscustomobject]@{ X = [int]$l; Y = [int]$t; Width = [int]($r - $l); Height = [int]($b - $t) }
+}
+
 # Where the floating toolbar goes in small mode: centered above the window, below it when there
 # is no room above, and inside its top edge when there is no room on either side.
 function Get-ToolbarPlacement($win, [int]$tbW, [int]$tbH, $area, [int]$gap) {
@@ -379,6 +442,16 @@ if ($SelfTest) {
         $got = @($r.X, $r.Y, $r.OverX, $r.OverY)
         Check (($got -join ',') -eq ($c.Want -join ',')) "push at=$($c.At -join ',') raw=$($c.Raw -join ',') got=$($got -join ',')"
     }
+    # Cursor lock area: real screens only, never a box that also covers a virtual screen.
+    function Scr($x, $y, $w, $h, $v) { [pscustomobject]@{ Bounds = [pscustomobject]@{ X = $x; Y = $y; Width = $w; Height = $h }; Virtual = $v } }
+    $hr = Get-HomeRect @((Scr 0 0 1920 1080 $false), (Scr 1920 0 1920 1080 $true))
+    Check ($hr -and $hr.X -eq 0 -and $hr.Width -eq 1920 -and $hr.Height -eq 1080) "home: main + virtual got=$($hr.X),$($hr.Y),$($hr.Width),$($hr.Height)"
+    $hr = Get-HomeRect @((Scr 0 0 1920 1080 $false), (Scr -1280 0 1280 1024 $false), (Scr 1920 0 1920 1080 $true))
+    Check ($hr -and $hr.X -eq -1280 -and $hr.Width -eq 3200 -and $hr.Height -eq 1080) "home: two real + virtual got=$($hr.X),$($hr.Width),$($hr.Height)"
+    $hr = Get-HomeRect @((Scr 0 0 1920 1080 $false), (Scr 1920 0 1920 1080 $true), (Scr 3840 0 1920 1080 $false))
+    Check ($null -eq $hr) "home: virtual between real screens -> no lock"
+    $hr = Get-HomeRect @((Scr 0 0 1920 1080 $false), (Scr 1920 0 1920 1080 $false))
+    Check ($null -eq $hr) "home: no virtual screen -> no lock"
     Write-Output "selftest: $($total - $fail)/$total passed"
     exit $fail
 }
@@ -444,6 +517,10 @@ $script:magBounds = $null
 $script:clock = [Diagnostics.Stopwatch]::StartNew()
 $script:lastFrameMs = -1000
 $script:tbLastNear = 0
+$script:lockOn = $true
+$script:clipMine = $false
+$script:homeRect = $null
+$script:homeCheckMs = -10000
 
 # --- main window ----------------------------------------------------------------------------
 $form = New-Object SvForm
@@ -540,6 +617,7 @@ function New-ToolButton([string]$tipText, [scriptblock]$onClick, [Drawing.Color]
 $btnPin     = New-ToolButton "Always on top" { $script:onTop = -not $script:onTop; $form.TopMost = $script:onTop; Update-Glyphs } $cHover
 $btnPointer = New-ToolButton "Show the pointer in the image" { Switch-Pointer } $cHover
 $btnMute    = New-ToolButton "Mute the apps on the second screen" { Switch-Mute } $cHover
+$btnLock    = New-ToolButton "Keep the mouse on the main screen" { Switch-Lock } $cHover
 $btnFull    = New-ToolButton "Full screen" { Set-Fullscreen (-not $script:full) } $cHover
 $btnHide    = New-ToolButton "Hide this bar (hover the top edge to bring it back)" { Switch-HideBar } $cHover
 $btnMin     = New-ToolButton "Minimize" { $form.WindowState = 'Minimized' } $cHover
@@ -573,6 +651,9 @@ function Update-Glyphs {
     $tip.SetToolTip($btnPointer, $(if ($script:showPointer) { "Pointer shown in the image (turn off when an app draws its own)" } else { "Pointer hidden in the image" }))
     $btnMute.Text = if ($script:muted.Count) { [string][char]0xE74F } else { [string][char]0xE767 }
     $btnMute.ForeColor = if ($script:muted.Count) { $cOn } else { $cText }
+    $btnLock.Text = if ($script:lockOn) { [string][char]0xE72E } else { [string][char]0xE785 }
+    $btnLock.ForeColor = if ($script:lockOn -and $script:homeRect) { $cOn } else { $cText }
+    $tip.SetToolTip($btnLock, $(if (-not $script:homeRect) { "Mouse lock: not needed or not possible with this screen layout" } elseif ($script:lockOn) { "Mouse kept on the main screen (drag a window or use the image to cross): on" } else { "Mouse kept on the main screen: off" }))
     $btnFull.Text = if ($script:full) { [string][char]0xE73F } else { [string][char]0xE740 }
     $tip.SetToolTip($btnFull, $(if ($script:full) { "Back to the small window" } else { "Full screen" }))
     $btnHide.Text = if ($script:userHid -and -not $script:full) { [string][char]0xE70D } else { [string][char]0xE70E }
@@ -630,6 +711,88 @@ function Set-Fullscreen([bool]$on) {
     Update-Glyphs
     Update-MagLayout
     if ($script:full -or -not $script:userHid) { Show-Toolbar } else { $tb.Hide() }
+}
+
+# --- cursor lock ----------------------------------------------------------------------------
+function Update-HomeRect {
+    $list = foreach ($sc in [Windows.Forms.Screen]::AllScreens) {
+        [pscustomobject]@{ Bounds = $sc.Bounds; Virtual = [SvClip]::IsVirtual($sc.DeviceName) }
+    }
+    $new = Get-HomeRect $list
+    if ("$($script:homeRect)" -ne "$new") {
+        Release-CursorLock   # still compares against the old area
+        $script:homeRect = $new
+        Write-ViewerLog "mouse lock area=$(if ($new) { "$($new.X),$($new.Y),$($new.Width)x$($new.Height)" } else { 'none' })"
+        Update-Glyphs
+    }
+}
+
+# A clip outlives the process that set it (checked on Windows 10), so a crashed viewer would leave
+# the mouse locked. A hidden watchdog process waits for the viewer to exit and then releases the
+# clip if it is still the one recorded in the state file; a normal close deletes the file first.
+$script:clipFile = Join-Path $env:TEMP "modo-equipo-viewer-clip-$PID.txt"
+function Start-ClipWatchdog {
+    $code = @"
+Add-Type 'using System; using System.Runtime.InteropServices; public static class W { [StructLayout(LayoutKind.Sequential)] public struct R { public int L, T, Rt, B; } [DllImport("user32.dll")] public static extern bool GetClipCursor(out R r); [DllImport("user32.dll")] public static extern bool ClipCursor(IntPtr r); [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v); }'
+[W]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null
+try { Wait-Process -Id $PID -ErrorAction Stop } catch {}
+`$f = '$($script:clipFile)'
+if (Test-Path `$f) {
+    `$want = (Get-Content `$f -Raw).Trim()
+    `$r = New-Object W+R; [void][W]::GetClipCursor([ref]`$r)
+    if ("`$(`$r.L),`$(`$r.T),`$(`$r.Rt),`$(`$r.B)" -eq `$want) { [void][W]::ClipCursor([IntPtr]::Zero) }
+    Remove-Item `$f -ErrorAction SilentlyContinue
+}
+"@
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+    try {
+        Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $enc" -WindowStyle Hidden | Out-Null
+        Write-ViewerLog "mouse lock watchdog started"
+    } catch { Write-ViewerLog "mouse lock watchdog failed: $($_.Exception.Message)" }
+}
+
+function Save-ClipState {
+    $h = $script:homeRect
+    try {
+        if ($script:clipMine -and $h) { Set-Content -Path $script:clipFile -Value "$($h.X),$($h.Y),$($h.X + $h.Width),$($h.Y + $h.Height)" -ErrorAction Stop }
+        elseif (Test-Path $script:clipFile) { Remove-Item $script:clipFile -ErrorAction Stop }
+    } catch {}
+}
+
+function Test-ClipIsHome($c) {
+    $h = $script:homeRect
+    return [bool]($h -and $c.X -eq $h.X -and $c.Y -eq $h.Y -and $c.Width -eq $h.Width -and $c.Height -eq $h.Height)
+}
+
+function Release-CursorLock {
+    if (-not $script:clipMine) { return }
+    # Only undo our own clip; a clip another program set later is left alone.
+    if (Test-ClipIsHome ([SvClip]::Current())) { [SvClip]::Release() }
+    $script:clipMine = $false
+    Save-ClipState
+}
+
+# Called every tick: lock while idle, free while a button is held or in direct mode.
+function Update-CursorLock([long]$now) {
+    if (($now - $script:homeCheckMs) -ge 1000) { $script:homeCheckMs = $now; Update-HomeRect }
+    $h = $script:homeRect
+    $want = $script:lockOn -and $h -and -not $script:remote -and -not $Smoke -and -not [SvClip]::AnyButtonDown()
+    if (-not $want) { Release-CursorLock; return }
+    $c = [SvClip]::Current()
+    if (Test-ClipIsHome $c) { if (-not $script:clipMine) { $script:clipMine = $true; Save-ClipState }; return }
+    # Re-apply only when nobody holds a clip (the clip is the whole desktop); never fight a
+    # program that confines the cursor itself (for example a game on the main screen).
+    if ($c -eq [Windows.Forms.SystemInformation]::VirtualScreen) {
+        [SvClip]::Set((New-Object Drawing.Rectangle($h.X, $h.Y, $h.Width, $h.Height)))
+        if (-not $script:clipMine) { $script:clipMine = $true; Save-ClipState }
+    }
+}
+
+function Switch-Lock {
+    $script:lockOn = -not $script:lockOn
+    if (-not $script:lockOn) { Release-CursorLock }
+    Write-ViewerLog "mouse lock=$($script:lockOn)"
+    Update-Glyphs
 }
 
 function Switch-Pointer {
@@ -736,6 +899,7 @@ function Enter-Remote($cur) {
     if (-not $t) { return }
     $script:px = [double]$t.X; $script:py = [double]$t.Y
     $script:lastX = $t.X; $script:lastY = $t.Y
+    Release-CursorLock   # the clip would hold the cursor on the main screen
     [SvNative]::SetCursorPos($t.X, $t.Y) | Out-Null
     $script:push = [pscustomobject]@{ X = 0; Y = 0 }
     $script:remote = $true
@@ -771,6 +935,7 @@ $timer.Add_Tick({
     $s = Get-SecondScreen
     if (-not $s) {
         $script:remote = $false
+        Release-CursorLock
         $form.Text = "Test screen (display removed)"
         return
     }
@@ -823,6 +988,8 @@ $timer.Add_Tick({
         elseif (-not $script:needLeave -and $form.WindowState -ne 'Minimized' -and [Windows.Forms.Control]::MouseButtons -eq 'None') { Enter-Remote $cur }
     }
 
+    Update-CursorLock $now
+
     # Toolbar auto-hide: always in full screen, in small mode only after the owner hid it.
     if ($tb.Visible -and ($script:full -or $script:userHid)) {
         $near = $tb.Bounds.Contains($cur)
@@ -862,6 +1029,7 @@ $form.Add_Shown({
     Update-Glyphs
     Show-Toolbar
     $timer.Start()
+    if (-not $Smoke) { Start-ClipWatchdog }
     if ($Smoke) {
         $script:stop = New-Object Windows.Forms.Timer
         $script:stop.Interval = [Math]::Max(1, $SmokeSeconds) * 1000
@@ -882,6 +1050,7 @@ $form.Add_Shown({
 })
 $form.Add_FormClosed({
     $timer.Stop()
+    Release-CursorLock
     if ($script:muted.Count) { try { [SvAudio]::SetMute([string[]]$script:muted, $false) | Out-Null } catch {} }
     $script:input.Close()
     if ($script:magOk) { [SvMag]::Shutdown() }

@@ -145,6 +145,8 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 - `-Smoke [-SmokeSeconds N]`: abre el visor unos segundos en la segunda pantalla, sin modo directo, e imprime qué motor de imagen usó (chequeo de desarrollo).
 - `MODO_EQUIPO_VIEWER_LOG=<archivo>`: registra los eventos para diagnosticar.
 - Sin segunda pantalla: muestra un aviso y termina con código 1.
+- Mouse en la pantalla principal: si hay una pantalla virtual (adaptador Parsec u otro "Virtual Display"), confina el cursor con `ClipCursor` al rectángulo de las pantallas reales mientras no haya botones apretados y no esté en modo directo; con un botón apretado (arrastre) lo libera al instante (revisa cada 8-16 ms). Solo vuelve a aplicarlo si nadie más tiene el cursor confinado (no pelea con juegos que lo confinan). No lo aplica si una pantalla virtual queda entre pantallas reales. Se apaga con el botón del candado.
+- El confinamiento sobrevive al proceso que lo puso (comprobado en Windows 10), así que el visor deja un proceso vigía oculto que lo libera si el visor termina sin cerrar bien; al cerrar normal lo libera el propio visor. En `-Smoke` no confina.
 
 ## second-screen/open-viewer.ps1
 
