@@ -10,6 +10,10 @@ Antes de lanzar nada, la skill verifica si el trabajo se puede dividir de verdad
 
 > Idea central: más agentes no es mejor. El paralelismo cuesta entre 3 y 15 veces los tokens de una sola sesión y falla cuando el código está muy acoplado. El respaldo está en [`references/research.md`](skills/modo-equipo/references/research.md).
 
+## Documentación
+
+La carpeta [`docs/`](docs/README.md) explica cada parte de la skill, para personas (en simple) y para IA (contratos exactos): cómo funciona, estado compartido, costos, pruebas sin usar tu mouse ni teclado, Gentle AI, cada script y cómo mantenerla.
+
 ## Requisitos
 
 | Requisito | ¿Obligatorio? | Si falta |

@@ -58,6 +58,39 @@ class PluginStructure(unittest.TestCase):
                 self.assertNotRegex(f.read(), r"\b[A-Z]:[\\/](Users|Claude|descargas)", name)
 
 
+class Docs(unittest.TestCase):
+    @staticmethod
+    def slug(heading):
+        # GitHub-style anchor: lowercase, drop punctuation except - and _, spaces to -.
+        text = heading.strip().lower()
+        text = re.sub(r"[^\w\- ]", "", text)
+        return text.replace(" ", "-")
+
+    def test_relative_links_and_anchors_resolve(self):
+        files = [os.path.join(ROOT, "README.md")]
+        docs = os.path.join(ROOT, "docs")
+        files += [os.path.join(docs, n) for n in sorted(os.listdir(docs)) if n.endswith(".md")]
+        self.assertGreaterEqual(len(files), 8)
+        broken = []
+        for path in files:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            for target in re.findall(r"\]\(([^)\s]+)\)", text):
+                if re.match(r"^[a-z]+:", target):
+                    continue  # external URL
+                file_part, _, anchor = target.partition("#")
+                dest = os.path.normpath(os.path.join(os.path.dirname(path), file_part)) if file_part else path
+                if not os.path.exists(dest):
+                    broken.append(f"{os.path.relpath(path, ROOT)} -> {target}")
+                    continue
+                if anchor and dest.endswith(".md"):
+                    with open(dest, encoding="utf-8") as f:
+                        slugs = {self.slug(h) for h in re.findall(r"^#+ (.+)$", f.read(), re.M)}
+                    if anchor not in slugs:
+                        broken.append(f"{os.path.relpath(path, ROOT)} -> {target} (anchor)")
+        self.assertEqual(broken, [])
+
+
 class SessionTokens(unittest.TestCase):
     def test_dedupes_repeated_lines_by_message_id(self):
         lines = [
