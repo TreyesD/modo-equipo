@@ -136,6 +136,30 @@ class GlobalRule(unittest.TestCase):
         self.assertEqual(self.read(), self.ORIGINAL)  # byte for byte
         self.assertEqual([n for n in os.listdir(self.tmp.name) if n != "CLAUDE.md"], [])  # no temp files left
 
+    def test_symlinked_file_is_written_through_and_keeps_the_link(self):
+        real = os.path.join(self.tmp.name, "dotfiles-CLAUDE.md")
+        with open(real, "w", encoding="utf-8", newline="") as f:
+            f.write(self.ORIGINAL)
+        try:
+            os.symlink(real, self.path)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks not available here (Windows without the right privilege)")
+        self.rule("install")
+        self.assertTrue(os.path.islink(self.path))
+        with open(real, encoding="utf-8", newline="") as f:
+            self.assertIn("<!-- modo-equipo:global-rule v", f.read())
+        self.rule("remove")
+        self.assertTrue(os.path.islink(self.path))
+        with open(real, encoding="utf-8", newline="") as f:
+            self.assertEqual(f.read(), self.ORIGINAL)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_file_permissions_are_kept(self):
+        self.write(self.ORIGINAL)
+        os.chmod(self.path, 0o644)
+        self.rule("install")
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o644)
+
     def test_damaged_markers_are_never_rewritten(self):
         damaged = "x\n<!-- modo-equipo:global-rule v1 -->\nclosing marker deleted by hand\n"
         self.write(damaged)
