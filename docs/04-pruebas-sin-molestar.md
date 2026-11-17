@@ -38,6 +38,7 @@ Si nada de eso sirve, Claude tiene que avisarte antes, decirte cuánto va a tard
 - **Clic, clic derecho, arrastrar y rueda** sobre la imagen ocurren en el mismo punto de la segunda pantalla. Tu cursor salta allí unas milésimas de segundo y vuelve solo: verás un parpadeo mínimo (Windows tiene un solo cursor).
 - **Doble clic** funciona: dos clics seguidos llegan como doble clic.
 - **Teclado**: al hacer clic en una ventana de la segunda pantalla, esa ventana queda activa y lo que escribes va a ella. Para volver, haz clic en tu pantalla.
+- **Para salir**: empuja el mouse más allá de cualquier borde de la imagen, o aprieta **Ctrl+Alt+Q**.
 - Un **punto rojo** muestra dónde está el cursor cuando pasa por la segunda pantalla.
 - Casilla **"Always on top"**: mantiene el visor encima de todo.
 - Funciona con pantallas de **escalas distintas** (por ejemplo 125% y 100%).

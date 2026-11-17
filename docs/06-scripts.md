@@ -136,7 +136,8 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 
 **Contrato:**
 - Uso: `powershell -NoProfile -ExecutionPolicy Bypass -STA -File scripts/second-screen/screen-viewer.ps1`
-- Modo directo: al pasar el mouse sobre la imagen, el cursor real salta a la segunda pantalla y se mueve escalado (sigue a tu mano 1:1 sobre la imagen). Clic, doble clic, arrastre y rueda son input nativo. Al pasar el borde de la imagen, el cursor vuelve a tu pantalla principal; con un botón apretado el arrastre continúa y no se escapa.
+- Modo directo: al pasar el mouse sobre la imagen, el cursor real salta a la segunda pantalla y se mueve escalado (sigue a tu mano 1:1 sobre la imagen). Clic, doble clic, arrastre y rueda son input nativo. Al pasar el borde de la imagen, el cursor vuelve a tu pantalla principal; con un botón apretado el arrastre continúa y no se escapa. Funciona en cualquier borde, también en los bordes exteriores del escritorio, donde Windows frena el cursor: el visor lee el movimiento crudo del mouse (Raw Input) y sale cuando sigues empujando hacia afuera.
+- Salida de emergencia: `Ctrl+Alt+Q` saca el cursor del modo directo desde cualquier lugar. Si otra app ya usa esa combinación, el visor lo avisa en su barra y queda solo la salida por los bordes.
 - Consumo: unos 20 cuadros por segundo en modo directo y 8 en reposo (≈15 % de un núcleo en reposo); el bucle fino de 8 ms solo corre mientras el cursor está en modo directo.
 - Trabaja en píxeles reales por pantalla (Per-Monitor DPI v2), necesario con escalas distintas entre pantallas.
 - `-SelfTest`: prueba la conversión de coordenadas sin abrir ventanas (código 0 = pasa).

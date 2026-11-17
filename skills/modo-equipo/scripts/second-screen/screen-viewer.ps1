@@ -54,6 +54,27 @@ function Convert-ScreenToView([double]$sx, [double]$sy, [double]$boxW, [double]$
     return [pscustomobject]@{ X = $offX + ($sx - $bounds.X) * $scale; Y = $offY + ($sy - $bounds.Y) * $scale; Scale = $scale }
 }
 
+# How hard the hand pushes past an edge where Windows holds the cursor still (the outer edges
+# of the desktop). $x,$y is the cursor on screen $bounds; $rawX,$rawY is the raw mouse motion
+# since the last tick; $push is the previous result. Moving back inward resets the push; a
+# tick with no motion keeps it. OverX/OverY is -1 or 1 once the push passes $threshold.
+function Get-EdgePush([int]$x, [int]$y, $bounds, [int]$rawX, [int]$rawY, $push, [int]$threshold = 6) {
+    $nx = 0; $ny = 0
+    if ($x -le $bounds.X) {
+        if ($rawX -lt 0) { $nx = [Math]::Min(0, $push.X) + $rawX } elseif ($rawX -eq 0) { $nx = [Math]::Min(0, $push.X) }
+    } elseif ($x -ge $bounds.X + $bounds.Width - 1) {
+        if ($rawX -gt 0) { $nx = [Math]::Max(0, $push.X) + $rawX } elseif ($rawX -eq 0) { $nx = [Math]::Max(0, $push.X) }
+    }
+    if ($y -le $bounds.Y) {
+        if ($rawY -lt 0) { $ny = [Math]::Min(0, $push.Y) + $rawY } elseif ($rawY -eq 0) { $ny = [Math]::Min(0, $push.Y) }
+    } elseif ($y -ge $bounds.Y + $bounds.Height - 1) {
+        if ($rawY -gt 0) { $ny = [Math]::Max(0, $push.Y) + $rawY } elseif ($rawY -eq 0) { $ny = [Math]::Max(0, $push.Y) }
+    }
+    $ox = if ($nx -le -$threshold) { -1 } elseif ($nx -ge $threshold) { 1 } else { 0 }
+    $oy = if ($ny -le -$threshold) { -1 } elseif ($ny -ge $threshold) { 1 } else { 0 }
+    return [pscustomobject]@{ X = $nx; Y = $ny; OverX = $ox; OverY = $oy }
+}
+
 if ($SelfTest) {
     $b = [pscustomobject]@{ X = 1920; Y = 0; Width = 1920; Height = 1080 }
     $cases = @(
@@ -71,12 +92,77 @@ if ($SelfTest) {
     }
     $inv = Convert-ScreenToView 2880 540 640 480 $b
     if ([Math]::Abs($inv.X - 320) -gt 0.01 -or [Math]::Abs($inv.Y - 240) -gt 0.01) { $fail++; Write-Output "FAIL inverse got=$($inv.X),$($inv.Y)" }
-    Write-Output "selftest: $($cases.Count + 1 - $fail)/$($cases.Count + 1) passed"
+    # Edge push: Windows stops the cursor at the outer edges of the desktop, so only the raw
+    # mouse motion shows that the hand keeps pushing outward.
+    $zero = [pscustomobject]@{ X = 0; Y = 0 }
+    $pushCases = @(
+        @{ At = @(3839, 500); Raw = @(4, 0);   Push = $zero;                                Want = @(4, 0, 0, 0) },   # right edge, below threshold
+        @{ At = @(3839, 500); Raw = @(3, 0);   Push = [pscustomobject]@{ X = 4; Y = 0 };    Want = @(7, 0, 1, 0) },   # right edge, accumulates past it
+        @{ At = @(2500, 0);   Raw = @(0, -9);  Push = $zero;                                Want = @(0, -9, 0, -1) }, # top edge, one strong push
+        @{ At = @(2500, 1079); Raw = @(0, 0);  Push = [pscustomobject]@{ X = 0; Y = 5 };    Want = @(0, 5, 0, 0) },   # bottom edge, still: keeps push
+        @{ At = @(3839, 500); Raw = @(-2, 0);  Push = [pscustomobject]@{ X = 5; Y = 0 };    Want = @(0, 0, 0, 0) },   # moving back inward resets
+        @{ At = @(2500, 500); Raw = @(50, 50); Push = [pscustomobject]@{ X = 5; Y = 5 };    Want = @(0, 0, 0, 0) }    # not on an edge: no push
+    )
+    foreach ($c in $pushCases) {
+        $r = Get-EdgePush $c.At[0] $c.At[1] $b $c.Raw[0] $c.Raw[1] $c.Push
+        $got = @($r.X, $r.Y, $r.OverX, $r.OverY)
+        if (($got -join ',') -ne ($c.Want -join ',')) { $fail++; Write-Output "FAIL push at=$($c.At -join ',') raw=$($c.Raw -join ',') got=$($got -join ',')" }
+    }
+    $total = $cases.Count + 1 + $pushCases.Count
+    Write-Output "selftest: $($total - $fail)/$total passed"
     exit $fail
 }
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# Hidden window that receives raw mouse motion (still reported when Windows holds the cursor
+# at the edge of the desktop) and the global exit hotkey (Ctrl+Alt+Q).
+Add-Type -ReferencedAssemblies System.Windows.Forms @"
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class SvInput : NativeWindow {
+    [StructLayout(LayoutKind.Sequential)] struct RAWINPUTDEVICE { public ushort UsagePage; public ushort Usage; public uint Flags; public IntPtr Target; }
+    [DllImport("user32.dll")] static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] d, uint n, uint size);
+    [DllImport("user32.dll")] static extern uint GetRawInputData(IntPtr h, uint cmd, IntPtr data, ref uint size, uint header);
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+    const int WM_INPUT = 0x00FF, WM_HOTKEY = 0x0312, HOTKEY_ID = 0x5356;
+    int dx, dy; bool hot;
+    public bool RawOk, HotkeyOk;
+    public SvInput() {
+        CreateHandle(new CreateParams());
+        var d = new RAWINPUTDEVICE[1];
+        d[0].UsagePage = 1; d[0].Usage = 2; d[0].Flags = 0x100; d[0].Target = Handle;   // mouse, RIDEV_INPUTSINK
+        RawOk = RegisterRawInputDevices(d, 1, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
+        HotkeyOk = RegisterHotKey(Handle, HOTKEY_ID, 0x0002 | 0x0001 | 0x4000, 0x51);       // Ctrl+Alt, no repeat, Q
+    }
+    public int TakeX() { int v = dx; dx = 0; return v; }
+    public int TakeY() { int v = dy; dy = 0; return v; }
+    public bool TakeHotkey() { bool v = hot; hot = false; return v; }
+    public void Close() { UnregisterHotKey(Handle, HOTKEY_ID); DestroyHandle(); }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == WM_INPUT) {
+            uint header = (uint)(8 + 2 * IntPtr.Size), size = 0;
+            GetRawInputData(m.LParam, 0x10000003, IntPtr.Zero, ref size, header);
+            if (size > 0) {
+                IntPtr buf = Marshal.AllocHGlobal((int)size);
+                try {
+                    if (GetRawInputData(m.LParam, 0x10000003, buf, ref size, header) == size && Marshal.ReadInt32(buf) == 0) {
+                        int off = (int)header;
+                        bool absolute = (Marshal.ReadInt16(buf, off) & 1) != 0;   // MOUSE_MOVE_ABSOLUTE (tablets, remote desktop)
+                        if (!absolute) { dx += Marshal.ReadInt32(buf, off + 12); dy += Marshal.ReadInt32(buf, off + 16); }
+                    }
+                } finally { Marshal.FreeHGlobal(buf); }
+            }
+        } else if (m.Msg == WM_HOTKEY && (int)m.WParam == HOTKEY_ID) {
+            hot = true;
+        }
+        base.WndProc(ref m);
+    }
+}
+"@
 
 # Hide only the console window, so the viewer form itself stays visible.
 [SvNative]::ShowWindow([SvNative]::GetConsoleWindow(), 0) | Out-Null
@@ -163,7 +249,7 @@ $onTop.AutoSize = $true
 $onTop.Location = New-Object Drawing.Point([int](6 * $k), [int](4 * $k))
 $onTop.Add_CheckedChanged({ $form.TopMost = $onTop.Checked })
 $hint = New-Object Windows.Forms.Label
-$hint.Text = "Move over the image to use the second screen; move past its edge to come back"
+$hint.Text = "Move over the image to use the second screen; push past any edge or press Ctrl+Alt+Q to come back"
 $hint.ForeColor = [Drawing.Color]::Silver
 $hint.AutoSize = $true
 $hint.Location = New-Object Drawing.Point(($onTop.Left + $onTop.PreferredSize.Width + [int](12 * $k)), [int](6 * $k))
@@ -226,6 +312,10 @@ $script:lastX = 0
 $script:lastY = 0
 $script:bmp = $null
 $script:frame = 0
+$script:push = [pscustomobject]@{ X = 0; Y = 0 }
+$script:input = New-Object SvInput
+Write-ViewerLog "raw input=$($script:input.RawOk) hotkey Ctrl+Alt+Q=$($script:input.HotkeyOk)"
+if (-not $script:input.HotkeyOk) { $hint.Text = "Move over the image to use the second screen; push past any edge to come back (Ctrl+Alt+Q is taken by another app)" }
 
 function Enter-Remote($cur) {
     $p = $pic.PointToClient($cur)
@@ -236,6 +326,7 @@ function Enter-Remote($cur) {
     $script:px = [double]$t.X; $script:py = [double]$t.Y
     $script:lastX = $t.X; $script:lastY = $t.Y
     [SvNative]::SetCursorPos($t.X, $t.Y) | Out-Null
+    $script:push = [pscustomobject]@{ X = 0; Y = 0 }
     $script:remote = $true
     Write-ViewerLog "enter remote at $($t.X),$($t.Y)"
 }
@@ -287,6 +378,13 @@ $timer.Add_Tick({
     }
     $b = $s.Bounds
     $cur = [Windows.Forms.Cursor]::Position
+    # Drain the raw motion and the hotkey every tick so old motion never counts later.
+    $rawX = $script:input.TakeX(); $rawY = $script:input.TakeY()
+    $hotkey = $script:input.TakeHotkey()
+    if ($script:remote -and $hotkey) {
+        Write-ViewerLog "exit by hotkey"
+        Exit-Remote $b 0 0
+    }
     if ($script:remote) {
         $dx = $cur.X - $script:lastX
         $dy = $cur.Y - $script:lastY
@@ -309,6 +407,17 @@ $timer.Add_Tick({
                 [SvNative]::SetCursorPos($script:lastX, $script:lastY) | Out-Null
             }
         }
+        # At the outer edges of the desktop Windows holds the cursor still, so the motion
+        # above never leaves; the raw motion still shows the hand pushing outward.
+        if ($script:remote -and [Windows.Forms.Control]::MouseButtons -eq 'None') {
+            $script:push = Get-EdgePush $script:lastX $script:lastY $b $rawX $rawY $script:push
+            if ($script:push.OverX -ne 0 -or $script:push.OverY -ne 0) {
+                Write-ViewerLog "exit by edge push $($script:push.OverX),$($script:push.OverY)"
+                Exit-Remote $b $script:push.OverX $script:push.OverY
+            }
+        } else {
+            $script:push = [pscustomobject]@{ X = 0; Y = 0 }
+        }
     } else {
         $pt = New-Object SvPt; $pt.X = $cur.X; $pt.Y = $cur.Y
         $over = ([SvNative]::WindowFromPoint($pt) -eq $pic.Handle)
@@ -327,6 +436,6 @@ $timer.Add_Tick({
     }
 })
 $timer.Start()
-$form.Add_FormClosed({ $timer.Stop() })
+$form.Add_FormClosed({ $timer.Stop(); $script:input.Close() })
 
 [Windows.Forms.Application]::Run($form)
