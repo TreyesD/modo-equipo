@@ -198,7 +198,7 @@ Wait for an explicit OK. Never launch sessions without it.
 
 ## Step 2 - Roles (split by context boundary, not by job title)
 
-- **Coordinator**: owns the spec and the shared state. Writes NO product code. Routes, reconciles, merges one branch at a time. Never pastes prose summaries; hands off by reference. Owns collection: every delegated task is waited for, read and integrated before the coordinator reports or moves on; fire-and-forget delegation is forbidden.
+- **Coordinator** (shown to the user as **technical direction**, "dirección técnica"): owns the spec and the shared state. Writes NO product code. Makes the technical decisions, reviews and accepts each delivery against the decode / spec before routing it to QA, talks with the user about ideas and product decisions. Routes, reconciles, merges one branch at a time. Never pastes prose summaries; hands off by reference. Owns collection: every delegated task is waited for, read and integrated before the coordinator reports or moves on; fire-and-forget delegation is forbidden.
 - **Development**: the ONLY writer of coupled product code. Works task by task from the feature document.
 - **QA**: read-only on product code. Reads the handoff from the feature document, not from chat. Tests the live running application, never only the code. Writes concrete pass/fail criteria including negative tests and returns a verdict per `S#`: PASS, or FAIL with reproduction steps. Is strict: any unmet criterion is FAIL, and an unverified one is not PASS. Does not self-certify the developer's work.
 - **Forks (QA or research only)**: allowed when a task is independent, high-volume and its output is mostly irrelevant to the parent. Disjoint edit surfaces, declared up front. Forks share the parent's prompt cache, so prefer them over fresh sessions.
@@ -214,6 +214,7 @@ That is 3 sessions. A 4th (a second writer or a dedicated research session) open
 
 - **One coordinator per team**: never run a second session that also checks status, routes or answers "what is going on". The user asks the coordinator. If one already exists (for example, a session left over from an earlier setup), fold it in: move anything still useful into the feature document or the Log, then propose archiving it.
 - **No QA, no review**: a task cannot move to `review` while no QA session exists. The coordinator creates it, or moves the task to `blocked` and says why in the Log.
+- **The coordinator starts its own team**: development and QA are started by the coordinator, so it can clear them and change their model later without the user. A session started elsewhere (an earlier setup, by hand) cannot be cleared from here: at its first hand-over, replace it with a session the coordinator starts, from its hand-over note.
 - **Lineup check**: on every coordinator status check, compare the live sessions with this lineup and report a missing role or an extra session in one line.
 
 ## Step 3 - Shared state in files, never in chat
@@ -248,6 +249,26 @@ Session names: `<project> - coordinador`, `<project> - desarrollo`, `<project> -
 - Decision ladder before acting: does it need to exist? already in the codebase? stdlib or native feature? installed dependency? only then write new code. Read the code a change touches before editing it.
 - Return summaries of at most ~2k tokens with `path:line` evidence; never dump files into the coordinator.
 - Route mechanical, read-only work to a cheaper model; keep the strongest model for design and the single writer.
+- **Model per role and per kind of task** (defaults; log each session's context tokens per task and raise or lower a level from that data):
+
+  | Who | Kind of task | Model |
+  |---|---|---|
+  | Coordinator (technical direction) | decisions, reviewing deliveries, talking with the user | strongest (Opus) |
+  | Development | the single writer | strongest (Opus), medium effort |
+  | QA | gates: run suites and checks, compare against a spec | cheaper (Sonnet), medium effort |
+  | QA | research: decoding, reverse engineering, new measurements | strongest (Opus), medium effort |
+  | Subagents of any session | see the subagent rule below | Sonnet or Haiku |
+
+  The coordinator stays on the strongest model even when it is idle most of the time: its turns are few, and one wrong judgment there spreads to every session. Save on it by clearing it with a hand-over note, not by lowering its model. When QA's next task switches between gate and research, apply the escalation rule below (fresh or cleared session on the new model, not a switch on a long history).
+- **Subagents inside a session** (Agent tool with a model override): use one only when the task produces a lot of output or repeats, so the parent reads a short result instead of the raw output. A check that takes 1-3 calls stays inline, because a subagent starts cold and pays to read. Sonnet: full merge checks (collisions, `--check`, tests, suites, restore generated files). Haiku: condense a long report or log section. Merge, product and acceptance decisions stay with the parent, from the subagent's numbers.
+- **A subagent's summary must be useful**: every brief demands this return shape, in at most ~15 lines:
+  1. verdict first (PASS / FAIL / partial / answer);
+  2. exact numbers (pass / fail / error counts, files) and the commit or branch checked;
+  3. on failure: the exact failing test or command and its first relevant error line, verbatim;
+  4. evidence as `path:line` or a file path, so one spot check is possible;
+  5. what was NOT checked or could not run.
+
+  No narration of steps, no file dumps. A summary missing items 1-3 is rejected and the brief is sent again once.
 - **Escalating to a more capable model saves tokens with a fresh session** (any model, any time a task needs more capability than the current one): every turn re-reads the session's whole history at its model's price, and a model change starts on a cold prompt cache (caches are per model). A long history re-read at a pricier rate costs more than starting over from the feature document. So:
   - To a pricier model: start a fresh session on it with a brief that points at the feature document, then archive the old session once its work is committed or backed up. The new session replaces the old one in the lineup; it never adds to it.
   - Switch an existing session's model only when its history is short (rough guide: under ~50k tokens) or its very next turn needs that exact history; a move to a cheaper model can be a switch.
