@@ -1,10 +1,12 @@
 # Launcher for the touch viewer: makes sure a second screen exists, then opens screen-viewer.ps1
-# from the same folder. The virtual screen is added by talking to the installed Parsec Virtual
-# Display Driver directly (parsec-vdd.ps1): no ParsecVDisplay window. It lives while the viewer
-# is open and is removed when the viewer closes. Only if the driver cannot be used does it fall
+# from the same folder. The screen comes from the background screen keeper (parsec-vdd.ps1
+# -Ensure), which talks to the installed Parsec Virtual Display Driver directly: no
+# ParsecVDisplay window. The viewer is registered as a holder, so the screen stays while the
+# viewer is open and for the keeper's idle time after it closes (tests may still need it); the
+# keeper also keeps the mouse on the main screen. Only if the driver cannot be used does it fall
 # back to starting the ParsecVDisplay app and pressing ADD DISPLAY.
-# -Smoke (developer check): always adds a screen through the driver, even when one exists, opens
-# the viewer in its -Smoke mode for a few seconds, then prints the screen count before/after.
+# -Smoke (developer check): runs the same -Ensure, opens the viewer in its -Smoke mode for a few
+# seconds and prints the -Ensure result.
 param([switch]$Smoke)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, UIAutomationClient, UIAutomationTypes
@@ -15,45 +17,29 @@ function Fail($msg) { [void][Windows.Forms.MessageBox]::Show($msg, 'Second scree
 # --- locate files -----------------------------------------------------------------------
 $viewer = Join-Path $PSScriptRoot 'screen-viewer.ps1'
 if (-not (Test-Path $viewer)) { Fail 'screen-viewer.ps1 not found next to this script.' }
-
-# --- 1. a second screen already exists: just open the viewer -----------------------------
 $viewerArgs = @{}
 if ($Smoke) { $viewerArgs = @{ Smoke = $true } }
-if ((Test-Second) -and -not $Smoke) { & $viewer; exit 0 }
 
-# --- 2. add the virtual screen through the driver (silent) -------------------------------
+# --- 1. ask the screen keeper for a second screen (silent) --------------------------------
+# Also when a screen already exists: registering the viewer as a holder turns on the mouse lock
+# for a virtual screen and keeps the screen while the viewer is open.
 $directError = $null
 $module = Join-Path $PSScriptRoot 'parsec-vdd.ps1'
 if (Test-Path $module) {
-  $vdd = $null
   try {
-    . $module
-    $before = [ModoEquipo.ParsecVdd]::MonitorCount()
-    $vdd = [ModoEquipo.ParsecVdd]::Open()
-    [void]$vdd.AddDisplay()
-    $deadline = (Get-Date).AddSeconds(15)
-    while ((Get-Date) -lt $deadline -and [ModoEquipo.ParsecVdd]::MonitorCount() -le $before) { Start-Sleep -Milliseconds 200 }
-    if ([ModoEquipo.ParsecVdd]::MonitorCount() -le $before) { throw 'The driver added a display but Windows reports no new screen.' }
-    Start-Sleep 1   # let Windows finish placing the new screen
+    $json = & $module -Ensure -HolderPid $PID
+    $r = "$json" | ConvertFrom-Json
+    if ($Smoke) { "smoke: ensure $json" }
+    if ($r.ok) { Start-Sleep -Milliseconds 500; & $viewer @viewerArgs; exit 0 }
+    $directError = $r.error
   } catch {
     if ($Smoke) { throw }
     $directError = $_.Exception.Message
-    if ($vdd) { $vdd.Dispose() }
-    $vdd = $null
-  }
-  if ($vdd) {
-    # The keep-alive thread pings the driver while the viewer runs; closing removes the screen.
-    try { & $viewer @viewerArgs } finally { $vdd.Dispose() }
-    if ($Smoke) {
-      $deadline = (Get-Date).AddSeconds(15)
-      while ((Get-Date) -lt $deadline -and [ModoEquipo.ParsecVdd]::MonitorCount() -gt $before) { Start-Sleep -Milliseconds 200 }
-      "smoke: screens before=$before after-close=$([ModoEquipo.ParsecVdd]::MonitorCount())"
-    }
-    exit 0
   }
 } else { $directError = 'parsec-vdd.ps1 not found next to this script.' }
+if (Test-Second) { & $viewer @viewerArgs; exit 0 }   # e.g. a real monitor, keeper unusable
 
-# --- 3. fallback: the ParsecVDisplay app -------------------------------------------------
+# --- 2. fallback: the ParsecVDisplay app -------------------------------------------------
 # ParsecVDisplay.exe: env var, saved path, running process, then common folders.
 $saved = Join-Path $env:USERPROFILE '.claude\modo-equipo\parsecvdisplay-path.txt'
 $running = Get-Process ParsecVDisplay -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.Path }

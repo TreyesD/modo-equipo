@@ -341,6 +341,31 @@ class LaunchOffscreen(unittest.TestCase):
         self.assertEqual(out.returncode, 3, out.stderr)
         self.assertEqual(json.loads(out.stdout)["reason"], "windows-only")
 
+    def test_keeper_command_and_ensure(self):
+        cmd = self.m.keeper_command(holder=42, script="k.ps1")
+        self.assertEqual(cmd[-5:], ["-File", "k.ps1", "-Ensure", "-HolderPid", "42"])
+        self.assertNotIn("-HolderPid", self.m.keeper_command(script="k.ps1"))
+        calls = []
+
+        class Out:
+            stdout = 'noise\n{"ok": true, "secondScreen": true, "keeper": "started"}\n'
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return Out()
+        answer = self.m.ensure_screen(holder=7, run=fake_run, environ={}, exists=lambda p: True)
+        self.assertEqual(answer["keeper"], "started")
+        self.assertIn("7", calls[0])
+        # Test switch and a missing keeper script: nothing is run.
+        self.assertIsNone(self.m.ensure_screen(run=fake_run, environ={"MODO_EQUIPO_NO_SECOND_SCREEN": "1"}, exists=lambda p: True))
+        self.assertIsNone(self.m.ensure_screen(run=fake_run, environ={}, exists=lambda p: False))
+        self.assertEqual(len(calls), 1)
+
+        def broken(cmd, **kw):
+            raise OSError("no powershell")
+        self.assertIsNone(self.m.ensure_screen(run=broken, environ={}, exists=lambda p: True))
+        self.assertTrue(self.m.parse_args(["--no-ensure", "--", "app"]).no_ensure)
+
     def test_screen_choice(self):
         screens = [{"primary": True}, {"primary": False, "id": "a"}, {"primary": False, "id": "b"}]
         self.assertEqual(self.m.choose_screen(screens, "auto")["id"], "a")
@@ -445,7 +470,10 @@ class ParsecVirtualDisplay(unittest.TestCase):
             launcher = f.read()
         self.assertIn("parsec-vdd.ps1", install)   # the shortcut copy must include the module
         self.assertIn("parsec-vdd.ps1", launcher)
-        self.assertIn("Dispose()", launcher)        # the screen is removed when the viewer closes
+        self.assertIn("-Ensure -HolderPid $PID", launcher)   # the viewer holds the keeper's screen
+        for name in ("launch-on-second-screen.ps1", "detect.ps1"):
+            with open(os.path.join(self.DIR, name), encoding="utf-8") as f:
+                self.assertIn("-Ensure", f.read(), name)   # launchers ask the keeper for a screen
 
     @unittest.skipUnless(sys.platform == "win32", "Windows PowerShell only")
     def test_self_test_checks_ioctls_without_adding_a_display(self):

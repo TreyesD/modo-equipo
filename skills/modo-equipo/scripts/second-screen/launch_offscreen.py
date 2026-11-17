@@ -1,7 +1,7 @@
 """Launch a program so that none of its windows is ever shown on the primary screen.
 
 Usage:
-    py -3 launch_offscreen.py [--screen N|auto] [--timeout S] [--keep-watch S] [--trace] -- <exe> [args...]
+    py -3 launch_offscreen.py [--screen N|auto] [--timeout S] [--keep-watch S] [--trace] [--no-ensure] -- <exe> [args...]
     py -3 launch_offscreen.py --list
 
 Windows only, Python 3 standard library only (ctypes). On other systems it prints
@@ -17,6 +17,10 @@ Method (zero-flash):
 4. Guard: any visible window that touches the primary screen is made transparent (WS_EX_LAYERED,
    alpha 0), moved to the second screen without activation, then made opaque again.
 
+When there is no second screen it first asks the screen keeper (parsec-vdd.ps1 -Ensure) for a
+virtual one, and registers the started program as a holder so the screen stays while it runs
+(--no-ensure turns this off).
+
 It never sends input, never takes focus, never injects code and never changes display settings.
 It does not wait for the program to end: the program keeps running after this script exits.
 
@@ -26,12 +30,15 @@ screen at the end (rule broken: stop that test and fix it).
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 
 EXIT_OK, EXIT_LAUNCH_FAILED, EXIT_USAGE, EXIT_NOT_WINDOWS, EXIT_NO_SECOND_SCREEN, EXIT_ON_PRIMARY = 0, 1, 2, 3, 4, 5
 IS_WINDOWS = sys.platform == "win32"
+KEEPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parsec-vdd.ps1")
+CREATE_NO_WINDOW = 0x08000000
 
 
 # ---------------------------------------------------------------- portable logic (tested on every OS)
@@ -61,6 +68,8 @@ def parse_args(argv):
                    help="seconds to keep guarding new windows after the first one")
     p.add_argument("--trace", action="store_true", help="include every observed window event in the result")
     p.add_argument("--list", action="store_true", help="print the screens and exit")
+    p.add_argument("--no-ensure", action="store_true",
+                   help="do not ask the screen keeper for a virtual screen when there is none")
     ns = p.parse_args(opts)
     if ns.screen != "auto":
         try:
@@ -77,6 +86,31 @@ def parse_args(argv):
         raise UsageError("missing command: use -- <exe> [args...]")
     ns.command = command
     return ns
+
+
+def keeper_command(holder=None, script=KEEPER):
+    """Command line that asks the screen keeper for a second screen (and registers a holder pid)."""
+    cmd = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+           "-File", script, "-Ensure"]
+    if holder:
+        cmd += ["-HolderPid", str(int(holder))]
+    return cmd
+
+
+def ensure_screen(holder=None, run=subprocess.run, environ=os.environ, exists=os.path.exists):
+    """Ask the screen keeper for a second screen. Returns its JSON answer, or None when the keeper
+    is not available or disabled (MODO_EQUIPO_NO_SECOND_SCREEN=1 is the test switch)."""
+    if environ.get("MODO_EQUIPO_NO_SECOND_SCREEN") == "1" or not exists(KEEPER):
+        return None
+    kwargs = {"capture_output": True, "text": True, "timeout": 60}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = CREATE_NO_WINDOW   # no console window flash
+    try:
+        out = run(keeper_command(holder), **kwargs)
+        lines = [line for line in (out.stdout or "").splitlines() if line.strip()]
+        return json.loads(lines[-1]) if lines else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
 
 
 def intersects(a, b):
@@ -404,6 +438,11 @@ def run_windows(ns):
         emit({"ok": True, "screens": screens})
         return EXIT_OK
     target = choose_screen(screens, ns.screen)
+    if target is None and not ns.no_ensure:
+        answer = ensure_screen()
+        if answer and answer.get("ok"):
+            screens = list_screens()
+            target = choose_screen(screens, ns.screen)
     if target is None:
         try:
             proc = subprocess.Popen(ns.command)
@@ -449,6 +488,9 @@ def run_windows(ns):
     finally:
         watcher.close()
         K.CloseHandle(pi.hProcess)
+
+    if not ns.no_ensure and not exited:
+        ensure_screen(holder=pi.dwProcessId)   # keep the screen while the program runs
 
     # Final check of every visible window of the process tree.
     open_windows = [{"hwnd": h, "rect": list(window_rect(h))}
