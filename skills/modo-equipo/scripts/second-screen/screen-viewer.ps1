@@ -604,6 +604,154 @@ public static class SvClip {
     public static void Release() { ClipCursor(IntPtr.Zero); }
 }
 
+// Sticky mute for the second screen: while on, a background thread mutes, about once a second,
+// every app whose window is on that screen, so apps that start playing later are muted too.
+// Turning it off (or closing the viewer) unmutes every app it muted.
+public static class SvAutoMute {
+    static readonly object gate = new object();
+    static System.Threading.Thread worker;
+    static volatile bool on;
+    static Rectangle area;
+    static int ownPid;
+    static readonly List<string> done = new List<string>();
+    public static string LastError = "";
+    public static bool On { get { return on; } }
+    public static string[] Muted { get { lock (gate) { return done.ToArray(); } } }
+    public static void Start(Rectangle screen, int pid) {
+        lock (gate) { area = screen; ownPid = pid; on = true; }
+        Apply();
+        if (worker == null) {
+            worker = new System.Threading.Thread(Loop);
+            worker.IsBackground = true;
+            worker.Start();
+        }
+    }
+    public static void SetArea(Rectangle screen) { lock (gate) { area = screen; } }
+    public static void Stop() {
+        string[] names;
+        lock (gate) { on = false; names = done.ToArray(); done.Clear(); }
+        if (names.Length > 0) { try { SvAudio.SetMute(names, false); } catch { } }
+    }
+    static void Loop() {
+        while (true) {
+            System.Threading.Thread.Sleep(1000);
+            if (on) { try { Apply(); } catch (Exception ex) { LastError = ex.Message; } }
+        }
+    }
+    // Returns how many sessions were muted in this pass.
+    public static int Apply() {
+        Rectangle a; int pid;
+        lock (gate) { if (!on) return 0; a = area; pid = ownPid; }
+        string[] names = SvAudio.ProcessNamesOn(a.X, a.Y, a.Width, a.Height, pid);
+        if (names.Length == 0) return 0;
+        int n = SvAudio.SetMute(names, true);
+        LastError = SvAudio.LastError;
+        lock (gate) {
+            if (!on) { SvAudio.SetMute(names, false); return 0; }   // turned off meanwhile
+            foreach (string x in names) if (!done.Contains(x)) done.Add(x);
+        }
+        return n;
+    }
+}
+
+// Direct mode: drives the real cursor on the second screen from its own 1 ms thread. Reading
+// the cursor, scaling the motion and moving the cursor happen within microseconds, so no hand
+// motion is lost in between (from the slow UI tick part of it was, which felt coarse and slower
+// than the normal mouse). The UI tick only reads the result and handles the exits.
+public static class SvDrive {
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out SvPt p);
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+    [DllImport("user32.dll")] static extern bool InvalidateRect(IntPtr h, IntPtr r, bool erase);
+    static readonly object gate = new object();
+    static System.Threading.Thread worker;
+    static bool active, exitReq;
+    static double px, py, scale = 1;
+    static int lastX, lastY, exitX, exitY;
+    static Rectangle area;
+    static readonly Stopwatch clock = Stopwatch.StartNew();
+    static long lastPaint;
+    // Window that shows the picture; repainted right after each move so the image follows the hand.
+    public static IntPtr Picture = IntPtr.Zero;
+    public static int Moves;
+    public static bool Active { get { lock (gate) { return active; } } }
+    public static int X { get { lock (gate) { return lastX; } } }
+    public static int Y { get { lock (gate) { return lastY; } } }
+    public static double PX { get { lock (gate) { return px; } } }
+    public static double PY { get { lock (gate) { return py; } } }
+
+    public static void Start(int x, int y, Rectangle screen, double s) {
+        lock (gate) {
+            px = x; py = y; lastX = x; lastY = y; area = screen; scale = s > 0 ? s : 1;
+            exitReq = false; active = true;
+            SetCursorPos(x, y);
+        }
+        if (worker == null) {
+            worker = new System.Threading.Thread(Loop);
+            worker.IsBackground = true;
+            worker.Priority = System.Threading.ThreadPriority.AboveNormal;
+            worker.Start();
+        }
+    }
+    public static void Update(Rectangle screen, double s) { lock (gate) { area = screen; if (s > 0) scale = s; } }
+    public static void Stop() { lock (gate) { active = false; exitReq = false; } }
+    // Set when the hand moved past an edge of the second screen with no button held.
+    public static int[] TakeExit() {
+        lock (gate) {
+            if (!exitReq) return null;
+            exitReq = false;
+            return new int[] { exitX, exitY };
+        }
+    }
+    static bool AnyButton() {
+        return (GetAsyncKeyState(0x01) & 0x8000) != 0 || (GetAsyncKeyState(0x02) & 0x8000) != 0 || (GetAsyncKeyState(0x04) & 0x8000) != 0;
+    }
+    static void Loop() {
+        while (true) {
+            Step();
+            System.Threading.Thread.Sleep(1);
+        }
+    }
+    static void Step() {
+        bool moved = false;
+        lock (gate) {
+            if (!active) return;
+            SvPt c;
+            if (!GetCursorPos(out c)) return;
+            int dx = c.X - lastX, dy = c.Y - lastY;
+            if (dx == 0 && dy == 0) return;
+            int ox, oy;
+            if (Advance(ref px, ref py, dx, dy, scale, area, AnyButton(), out ox, out oy)) {
+                active = false; exitReq = true; exitX = ox; exitY = oy;
+                return;
+            }
+            lastX = (int)Math.Round(px); lastY = (int)Math.Round(py);
+            SetCursorPos(lastX, lastY);
+            Moves++;
+            moved = true;
+        }
+        if (moved && Picture != IntPtr.Zero && clock.ElapsedMilliseconds - lastPaint >= 4) {
+            lastPaint = clock.ElapsedMilliseconds;
+            InvalidateRect(Picture, IntPtr.Zero, false);
+        }
+    }
+    // One step of the scaled motion: the hand moved (dx, dy) on the cursor; on the second screen
+    // that is (dx, dy) / scale, so the pointer on the image follows the hand 1:1. Returns true
+    // (and the edge it left by) when the point leaves the screen with no button held; otherwise
+    // the point is clamped to the screen (a drag keeps going).
+    public static bool Advance(ref double x, ref double y, int dx, int dy, double s, Rectangle b, bool held, out int ox, out int oy) {
+        if (s <= 0) s = 1;
+        x += dx / s; y += dy / s;
+        ox = x < b.Left ? -1 : (x >= b.Right ? 1 : 0);
+        oy = y < b.Top ? -1 : (y >= b.Bottom ? 1 : 0);
+        if ((ox != 0 || oy != 0) && !held) return true;
+        x = Math.Max(b.Left, Math.Min(b.Right - 1, x));
+        y = Math.Max(b.Top, Math.Min(b.Bottom - 1, y));
+        ox = 0; oy = 0;
+        return false;
+    }
+}
+
 // Hidden window that receives raw mouse motion (still reported when Windows holds the cursor
 // at the edge of the desktop) and the global exit hotkey (Ctrl+Alt+Q).
 public class SvInput : NativeWindow {
@@ -758,6 +906,21 @@ if ($SelfTest) {
         $got = @($r.X, $r.Y, $r.OverX, $r.OverY)
         Check (($got -join ',') -eq ($c.Want -join ',')) "push at=$($c.At -join ',') raw=$($c.Raw -join ',') got=$($got -join ',')"
     }
+    # Direct mode motion: scaled by the image size, no motion lost, clamped while a button is held.
+    $sb = New-Object Drawing.Rectangle(1920, 0, 1920, 1080)
+    $x = 2000.0; $y = 500.0; $ox = 0; $oy = 0
+    $left = [SvDrive]::Advance([ref]$x, [ref]$y, 3, -2, 0.25, $sb, $false, [ref]$ox, [ref]$oy)
+    Check (-not $left -and $x -eq 2012 -and $y -eq 492) "drive scaled step got=$x,$y"
+    $x = 2000.0; $y = 500.0
+    for ($i = 0; $i -lt 40; $i++) { [SvDrive]::Advance([ref]$x, [ref]$y, 1, 0, 0.3, $sb, $false, [ref]$ox, [ref]$oy) | Out-Null }
+    Check ([Math]::Abs($x - (2000 + 40 / 0.3)) -lt 0.001) "drive keeps fractions of small moves got=$x"
+    $x = 3830.0; $y = 500.0
+    $left = [SvDrive]::Advance([ref]$x, [ref]$y, 5, 0, 0.5, $sb, $false, [ref]$ox, [ref]$oy)
+    Check ($left -and $ox -eq 1 -and $oy -eq 0) "drive leaves by the right edge got=$left $ox,$oy"
+    $x = 3830.0; $y = 500.0
+    $left = [SvDrive]::Advance([ref]$x, [ref]$y, 5, 0, 0.5, $sb, $true, [ref]$ox, [ref]$oy)
+    Check (-not $left -and $x -eq 3839) "drive clamps while a button is held got=$x"
+    Check (-not [SvAutoMute]::On) "auto mute starts off"
     Write-Output "selftest: $($total - $fail)/$total passed"
     exit $fail
 }
@@ -809,7 +972,6 @@ $script:normalBounds = $null
 $script:onTop = $true
 $script:showPointer = $true
 $script:keepBar = $false
-$script:muted = @()
 $script:mag = [IntPtr]::Zero
 $script:magOk = $false
 $script:pic = $null
@@ -908,9 +1070,10 @@ function Update-Glyphs {
     $btnPointer.Glyph = [string][char]0xE8B0
     $btnPointer.On = $script:showPointer
     $btnPointer.Tip = if ($script:showPointer) { "Pointer shown in the image (turn off when an app draws its own)" } else { "Pointer hidden in the image" }
-    $btnMute.Glyph = if ($script:muted.Count) { [string][char]0xE74F } else { [string][char]0xE767 }
-    $btnMute.On = [bool]$script:muted.Count
-    $btnMute.Tip = if ($script:muted.Count) { "Apps on the second screen muted: click to unmute" } else { "Mute the apps on the second screen" }
+    $muteOn = [SvAutoMute]::On
+    $btnMute.Glyph = if ($muteOn) { [string][char]0xE74F } else { [string][char]0xE767 }
+    $btnMute.On = $muteOn
+    $btnMute.Tip = if ($muteOn) { "Second screen sound: muted (the apps on that screen, including ones that start playing later). Click to unmute" } else { "Second screen sound: on. Click to mute the apps on that screen (Windows has no per-screen mute)" }
     $lockOn = -not (Test-Path $script:lockOffFile)
     $btnLock.Glyph = if ($lockOn) { [string][char]0xE72E } else { [string][char]0xE785 }
     $btnLock.On = $lockOn
@@ -1021,20 +1184,20 @@ function Switch-Pointer {
 
 function Switch-Mute {
     try {
-        if ($script:muted.Count) {
-            [SvAudio]::SetMute([string[]]$script:muted, $false) | Out-Null
-            Write-ViewerLog "unmuted $($script:muted -join ',')"
-            $script:muted = @()
+        if ([SvAutoMute]::On) {
+            $was = [SvAutoMute]::Muted
+            [SvAutoMute]::Stop()
+            Write-ViewerLog "mute off, unmuted $($was -join ',')"
+            $bar.ShowTip("Second screen sound: on", 'mute')
         } else {
             $s = Get-SecondScreen
             if (-not $s) { return }
-            $b = $s.Bounds
-            $names = [SvAudio]::ProcessNamesOn($b.X, $b.Y, $b.Width, $b.Height, $PID)
-            $n = [SvAudio]::SetMute($names, $true)
-            Write-ViewerLog "muted sessions=$n apps=$($names -join ',') error=$([SvAudio]::LastError)"
-            if ($n -gt 0) { $script:muted = @($names) }
-            elseif ([SvAudio]::LastError) { $bar.ShowTip("Could not mute: $([SvAudio]::LastError)", 'mute') }
-            else { $bar.ShowTip("No sound found from the apps on the second screen", 'mute') }
+            [SvAutoMute]::Start($s.Bounds, $PID)
+            $names = [SvAutoMute]::Muted
+            Write-ViewerLog "mute on apps=$($names -join ',') error=$([SvAutoMute]::LastError)"
+            if ([SvAutoMute]::LastError) { $bar.ShowTip("Muted, but one app failed: $([SvAutoMute]::LastError)", 'mute') }
+            elseif ($names.Count) { $bar.ShowTip("Second screen sound: muted ($($names -join ', '))", 'mute') }
+            else { $bar.ShowTip("Second screen sound: muted (no app there is playing yet; any that starts is muted)", 'mute') }
         }
     } catch {
         # Never fail silently: the owner sees why the button did nothing.
@@ -1057,6 +1220,7 @@ function Initialize-View {
         $script:pic.SizeMode = 'Zoom'
         $view.Controls.Add($script:pic)
     }
+    if ($script:magOk) { [SvDrive]::Picture = $script:mag }
     Write-ViewerLog "renderer=$(if ($script:magOk) { 'magnification' } else { 'gdi' })"
     Update-MagLayout
 }
@@ -1122,13 +1286,21 @@ function Enter-Remote($cur) {
     $script:px = [double]$t.X; $script:py = [double]$t.Y
     $script:lastX = $t.X; $script:lastY = $t.Y
     Grant-CursorFree   # the keeper's clip would hold the cursor on the main screen
-    [SvNative]::SetCursorPos($t.X, $t.Y) | Out-Null
+    [SvDrive]::Start($t.X, $t.Y, $s.Bounds, (Get-ViewScale $s.Bounds))
     $script:push = [pscustomobject]@{ X = 0; Y = 0 }
     $script:remote = $true
     Write-ViewerLog "enter remote at $($t.X),$($t.Y)"
 }
 
+function Get-ViewScale($b) {
+    $scale = [Math]::Min($view.ClientSize.Width / $b.Width, $view.ClientSize.Height / $b.Height)
+    if ($scale -le 0) { $scale = 1 }
+    return [double]$scale
+}
+
 function Exit-Remote($b, $overX, $overY) {
+    [SvDrive]::Stop()
+    $script:px = [SvDrive]::PX; $script:py = [SvDrive]::PY
     $script:remote = $false
     $script:needLeave = $true
     if ($script:full) {
@@ -1157,12 +1329,14 @@ $timer.Interval = 16
 $timer.Add_Tick({
     $s = Get-SecondScreen
     if (-not $s) {
+        [SvDrive]::Stop()
         $script:remote = $false
         Return-CursorFree
         $form.Text = "Test screen (display removed)"
         return
     }
     $b = $s.Bounds
+    if ([SvAutoMute]::On) { [SvAutoMute]::SetArea($b) }
     $now = $script:clock.ElapsedMilliseconds
     $cur = [Windows.Forms.Cursor]::Position
     # Drain the raw motion and the hotkey every tick so old motion never counts later.
@@ -1173,26 +1347,13 @@ $timer.Add_Tick({
         Exit-Remote $b 0 0
     }
     if ($script:remote) {
-        $dx = $cur.X - $script:lastX
-        $dy = $cur.Y - $script:lastY
-        if ($dx -ne 0 -or $dy -ne 0) {
-            $scale = [Math]::Min($view.ClientSize.Width / $b.Width, $view.ClientSize.Height / $b.Height)
-            if ($scale -le 0) { $scale = 1 }
-            $script:px += $dx / $scale
-            $script:py += $dy / $scale
-            $ox = 0; $oy = 0
-            if ($script:px -lt $b.Left) { $ox = -1 } elseif ($script:px -ge $b.Right) { $ox = 1 }
-            if ($script:py -lt $b.Top) { $oy = -1 } elseif ($script:py -ge $b.Bottom) { $oy = 1 }
-            if (($ox -ne 0 -or $oy -ne 0) -and [Windows.Forms.Control]::MouseButtons -eq 'None') {
-                Exit-Remote $b $ox $oy
-            } else {
-                # Inside, or a button is held (a drag keeps going): clamp to the screen.
-                $script:px = [Math]::Max($b.Left, [Math]::Min($b.Right - 1, $script:px))
-                $script:py = [Math]::Max($b.Top, [Math]::Min($b.Bottom - 1, $script:py))
-                $script:lastX = [int][Math]::Round($script:px)
-                $script:lastY = [int][Math]::Round($script:py)
-                [SvNative]::SetCursorPos($script:lastX, $script:lastY) | Out-Null
-            }
+        # The cursor itself is moved by SvDrive's thread; here only its exits are handled.
+        $exit = [SvDrive]::TakeExit()
+        if ($exit) {
+            Exit-Remote $b $exit[0] $exit[1]
+        } else {
+            [SvDrive]::Update($b, (Get-ViewScale $b))
+            $script:lastX = [SvDrive]::X; $script:lastY = [SvDrive]::Y
         }
         # At the outer edges of the desktop Windows holds the cursor still, so the motion
         # above never leaves; the raw motion still shows the hand pushing outward.
@@ -1264,8 +1425,9 @@ $form.Add_Shown({
 })
 $form.Add_FormClosed({
     $timer.Stop()
+    [SvDrive]::Stop()
     Return-CursorFree
-    if ($script:muted.Count) { try { [SvAudio]::SetMute([string[]]$script:muted, $false) | Out-Null } catch {} }
+    try { [SvAutoMute]::Stop() } catch {}
     $script:input.Close()
     if ($script:magOk) { [SvMag]::Shutdown() }
     [SvNative]::timeEndPeriod(1) | Out-Null
