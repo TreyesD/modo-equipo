@@ -1,22 +1,26 @@
 """Install, check or remove the modo-equipo global test rule block in a CLAUDE.md file.
 
 Usage:
-  python global_rule.py status  [--file PATH]   prints: missing | current vN | outdated vN (latest vM)
+  python global_rule.py status  [--file PATH]   prints: missing | current vN | outdated vN (latest vM) | broken: ...
   python global_rule.py install [--file PATH]   adds the block, or replaces an older version
   python global_rule.py remove  [--file PATH]   deletes the block
 
 PATH defaults to ~/.claude/CLAUDE.md. The block text comes from references/global-rule.md
 next to this script's folder. Only the marked block is ever touched; the rest of the file
-is kept byte for byte. Run install only after the user said yes.
+is kept byte for byte, and files are written atomically. Exit code 2 means the markers are
+damaged and nothing was changed. Run install only after the user said yes.
 """
 import argparse
 import os
 import re
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REFERENCE = os.path.join(HERE, "..", "references", "global-rule.md")
 BLOCK_RE = re.compile(r"<!-- modo-equipo:global-rule v(\d+) -->.*?<!-- /modo-equipo:global-rule -->", re.S)
+OPEN_RE = re.compile(r"<!-- modo-equipo:global-rule v\d+ -->")
+CLOSE = "<!-- /modo-equipo:global-rule -->"
 
 
 def reference_block():
@@ -35,14 +39,33 @@ def read(path):
 
 
 def write(path, text):
-    folder = os.path.dirname(path)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
+    """Write atomically: a temp file in the same folder, then replace. The original file is
+    never truncated, so an interruption cannot leave a half-written CLAUDE.md."""
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".CLAUDE.md.", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def broken(text):
+    """True when the markers do not pair up (for example a hand-deleted closing marker)."""
+    opens = len(OPEN_RE.findall(text))
+    closes = text.count(CLOSE)
+    return opens != closes or opens != len(BLOCK_RE.findall(text)) or opens > 1
 
 
 def status(text, latest):
+    if broken(text):
+        return "broken: unmatched or repeated modo-equipo:global-rule markers; fix the file by hand"
     match = BLOCK_RE.search(text)
     if not match:
         return "missing"
@@ -65,11 +88,22 @@ def main():
 
     if args.action == "status":
         print(status(text, latest))
-    elif args.action == "install":
+        return
+    if broken(text):
+        print(status(text, latest))
+        sys.exit(2)  # never guess where a damaged block ends
+
+    if args.action == "install":
         if BLOCK_RE.search(text):
             text = BLOCK_RE.sub(lambda _: block, text, count=1)
         else:
-            separator = "" if not text or text.endswith(newline * 2) else (newline if text.endswith(newline) else newline * 2)
+            # Leave exactly one blank line between the existing text and the block.
+            if not text:
+                separator = ""
+            elif text.endswith(newline):
+                separator = newline
+            else:
+                separator = newline * 2
             text = text + separator + block + newline
         write(args.file, text)
         print(status(text, latest))
@@ -77,11 +111,14 @@ def main():
         match = BLOCK_RE.search(text)
         new = text
         if match:
-            # Drop the block plus the line break that followed it; leave everything else as is.
-            end = match.end()
+            start, end = match.start(), match.end()
             if text.startswith(newline, end):
                 end += len(newline)
-            new = text[:match.start()] + text[end:]
+            before, after = text[:start], text[end:]
+            # A block at the end of the file was preceded by the blank line install added: drop it too.
+            if not after and before.endswith(newline * 2):
+                before = before[:-len(newline)]
+            new = before + after
         if new != text:
             write(args.file, new)
         print(status(new, latest))

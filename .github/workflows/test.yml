@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -51,7 +54,8 @@ jobs:
           node-version: "22"
 
       - name: Install Claude Code
-        run: npm install -g @anthropic-ai/claude-code
+        # Pinned so an upstream release cannot change or break this check unnoticed; bump on purpose.
+        run: npm install -g @anthropic-ai/claude-code@2.1.325
 
       - name: Validate and install the plugin in a clean Claude Code
         env:

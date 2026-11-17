@@ -133,7 +133,17 @@ class GlobalRule(unittest.TestCase):
         self.assertEqual(self.read(), once)
         self.assertEqual(once.count("<!-- modo-equipo:global-rule"), 1)
         self.assertEqual(self.rule("remove"), "missing")
-        self.assertEqual(self.read(), self.ORIGINAL + "\n")
+        self.assertEqual(self.read(), self.ORIGINAL)  # byte for byte
+        self.assertEqual([n for n in os.listdir(self.tmp.name) if n != "CLAUDE.md"], [])  # no temp files left
+
+    def test_damaged_markers_are_never_rewritten(self):
+        damaged = "x\n<!-- modo-equipo:global-rule v1 -->\nclosing marker deleted by hand\n"
+        self.write(damaged)
+        self.assertTrue(self.rule("status").startswith("broken"))
+        for action in ("install", "remove"):
+            out = run("global_rule.py", action, "--file", self.path)
+            self.assertEqual(out.returncode, 2, action)
+            self.assertEqual(self.read(), damaged, action)
 
     def test_outdated_block_is_replaced_in_place(self):
         old = "<!-- modo-equipo:global-rule v0 -->\nold text\n<!-- /modo-equipo:global-rule -->"
@@ -198,6 +208,8 @@ class DsuServer(unittest.TestCase):
                     data = s.recv(256)
                     self.assertEqual(len(data), 100)
                     self.assertTrue(self.crc_ok(data))
+                    # header 16 + message type 4 + pad info 11 + (active, counter, buttons) 9
+                    # + sticks 4 + analog D-pad 4 and Square 1 -> the Cross analog byte
                     cross = 16 + 4 + 11 + 9 + 4 + 5
                     self.assertEqual(data[cross], 0)
                     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as c:
