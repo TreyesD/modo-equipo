@@ -126,6 +126,7 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 - Uso: `powershell -NoProfile -ExecutionPolicy Bypass -STA -File scripts/second-screen/open-viewer.ps1`. Lo normal es usarlo desde el acceso directo (`install-desktop-shortcut.ps1`).
 - Con segunda pantalla ya presente, solo abre `screen-viewer.ps1` (de la misma carpeta).
 - Sin ella, localiza `ParsecVDisplay.exe` (variable `PARSECVDISPLAY_EXE`, archivo `~/.claude/modo-equipo/parsecvdisplay-path.txt`, proceso en ejecución o carpetas habituales), pulsa el botón por UI Automation (sin mover el mouse) y espera hasta 20 s a que Windows reporte la pantalla.
+- Si no encuentra `ParsecVDisplay.exe` (y no hay segunda pantalla), pregunta al dueño: elegir el .exe con un selector de archivos (la ruta queda guardada), abrir el visor igual o no hacer nada. Nunca busca en el disco ni descarga.
 - Si algo falla muestra un mensaje de error; nunca falla en silencio.
 - No descarga ni instala nada: solo inicia un ParsecVDisplay que el usuario ya tiene, y solo cuando el usuario hace clic.
 

@@ -20,11 +20,25 @@ $pvd = @(
   "$env:LOCALAPPDATA\Programs\ParsecVDisplay\ParsecVDisplay.exe",
   "$env:ProgramFiles\ParsecVDisplay\ParsecVDisplay.exe"
 ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+# Not found anywhere: ask the owner where it is (the skill never searches the disk or downloads).
+if (-not $pvd -and -not (Test-Second)) {
+  $ans = [Windows.Forms.MessageBox]::Show(
+    "No second screen is available and ParsecVDisplay.exe could not be found.`n`nYes = pick ParsecVDisplay.exe now`nNo = open the viewer anyway`nCancel = do nothing",
+    'Second screen viewer', 'YesNoCancel', 'Question')
+  if ($ans -eq 'Cancel') { exit 0 }
+  if ($ans -eq 'Yes') {
+    $dlg = New-Object Windows.Forms.OpenFileDialog
+    $dlg.Title = 'Select ParsecVDisplay.exe'
+    $dlg.Filter = 'ParsecVDisplay.exe|ParsecVDisplay.exe|Programs (*.exe)|*.exe'
+    if ($dlg.ShowDialog() -ne 'OK') { exit 0 }
+    $pvd = $dlg.FileName
+  }
+}
 if ($pvd -and $pvd -ne $running) { try { Set-Content -Path $saved -Value $pvd -ErrorAction Stop } catch {} }
 
 # --- make sure a second screen exists ---------------------------------------------------
 if (-not (Test-Second)) {
-  if (-not $pvd) { Fail 'No second screen and ParsecVDisplay.exe was not found. Set PARSECVDISPLAY_EXE or write its full path in ~/.claude/modo-equipo/parsecvdisplay-path.txt.' }
+  if (-not $pvd) { & $viewer; exit 0 }   # owner chose to open the viewer without a second screen
   $proc = Get-Process ParsecVDisplay -ErrorAction SilentlyContinue | Select-Object -First 1
   if (-not $proc) { Start-Process $pvd; Start-Sleep 2 }
   # Starting the exe again makes the running instance show its window.
