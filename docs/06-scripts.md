@@ -14,6 +14,8 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 | [`scripts/second-screen/launch-on-second-screen.ps1`](#second-screenlaunch-on-second-screenps1) | Windows | Abrir el corredor de pruebas en la segunda pantalla |
 | [`scripts/second-screen/run-tests.ps1`](#second-screenrun-testsps1) | Windows | Detectar y ejecutar las suites de prueba |
 | [`scripts/second-screen/screen-viewer.ps1`](#second-screenscreen-viewerps1) | Windows | Visor táctil de la segunda pantalla |
+| [`scripts/second-screen/open-viewer.ps1`](#second-screenopen-viewerps1) | Windows | Crear la pantalla virtual si falta y abrir el visor |
+| [`scripts/second-screen/install-desktop-shortcut.ps1`](#second-screenopen-viewerps1) | Windows | Acceso directo en el Escritorio para el visor |
 
 ---
 
@@ -115,3 +117,21 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 - `-SelfTest`: prueba la conversión de coordenadas sin abrir ventanas (código 0 = pasa).
 - `MODO_EQUIPO_VIEWER_LOG=<archivo>`: registra los eventos para diagnosticar.
 - Sin segunda pantalla: muestra un aviso y termina con código 1.
+
+## second-screen/open-viewer.ps1
+
+**En simple:** un clic que deja todo listo: si no hay segunda pantalla, inicia ParsecVDisplay, pulsa "ADD DISPLAY" y abre el visor.
+
+**Contrato:**
+- Uso: `powershell -NoProfile -ExecutionPolicy Bypass -STA -File scripts/second-screen/open-viewer.ps1`. Lo normal es usarlo desde el acceso directo (`install-desktop-shortcut.ps1`).
+- Con segunda pantalla ya presente, solo abre `screen-viewer.ps1` (de la misma carpeta).
+- Sin ella, localiza `ParsecVDisplay.exe` (variable `PARSECVDISPLAY_EXE`, archivo `~/.claude/modo-equipo/parsecvdisplay-path.txt`, proceso en ejecución o carpetas habituales), pulsa el botón por UI Automation (sin mover el mouse) y espera hasta 20 s a que Windows reporte la pantalla.
+- Si algo falla muestra un mensaje de error; nunca falla en silencio.
+- No descarga ni instala nada: solo inicia un ParsecVDisplay que el usuario ya tiene, y solo cuando el usuario hace clic.
+
+## second-screen/install-desktop-shortcut.ps1
+
+**En simple:** crea el icono "Visor segunda pantalla" en el Escritorio.
+
+**Contrato:**
+- Ejecutarlo a mano, una vez. Copia `open-viewer.ps1` y `screen-viewer.ps1` a `~/.claude/modo-equipo/viewer/` para que el acceso directo siga funcionando tras actualizar el plugin; volver a ejecutarlo actualiza esas copias.

@@ -33,6 +33,7 @@ Project: https://github.com/VirtualDrivers/Virtual-Display-Driver (assets named 
 - `scripts/second-screen/launch-on-second-screen.ps1 -Root <project>`: opens the test runner window on the second screen. Exit code 2 and `NO_SECOND_SCREEN` when there is none.
 - `scripts/second-screen/run-tests.ps1`: detects suites (package.json `test` script, pytest `tests/`, `go.mod`, `Cargo.toml`), runs them in order, writes `~/.claude/modo-equipo/tests-last.json` (`status` running|done, result per suite) and `tests-last.log`. Override detection with `<project>/.modo-equipo-tests.json`: `[{"name":"api","dir":"services/api","cmd":"npm test"}]`.
 - `scripts/second-screen/screen-viewer.ps1`: small always-on-top window on the main screen that mirrors the second one live. Display only; click and type work on the real screen.
+- `scripts/second-screen/open-viewer.ps1`: one-click entry point. Adds the ParsecVDisplay virtual screen when there is none (starts the already-installed `ParsecVDisplay.exe` and presses ADD DISPLAY), then opens the viewer. `install-desktop-shortcut.ps1` creates a desktop shortcut for it; the user runs that once.
 
 ## Troubleshooting
 
