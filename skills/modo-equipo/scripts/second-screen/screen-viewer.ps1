@@ -1,7 +1,8 @@
 param(
     [switch]$SelfTest,
     [switch]$Smoke,
-    [int]$SmokeSeconds = 5
+    [int]$SmokeSeconds = 5,
+    [string]$SmokeOn = ''
 )
 # Live, touch-style view of the second screen, shown on the main screen.
 # Moving the pointer over the image puts the real cursor on the second screen (direct mode):
@@ -12,12 +13,16 @@ param(
 # The lock is released when the viewer closes and can be turned off from the toolbar.
 # The picture comes from the Windows Magnification API (GPU, ~60 fps, real cursor shape); when it
 # is not available the viewer falls back to a GDI screen copy.
-# The window has no Windows title bar: a thin strip on top moves it, its edges resize it, and a
-# floating toolbar (outside the window in small mode, auto-hidden at the top in full screen)
-# holds always-on-top, pointer, mute, full screen, hide, minimize and close.
+# The window has no Windows title bar: a thin strip on top moves it and its edges resize it.
+# The toolbar is a small rounded pill docked at the top centre (of the window, or of the screen
+# in full screen): it rests as a thin handle, opens while the pointer is near it, can be slid
+# along the top edge from its grip, and holds always-on-top, pointer, mute, mouse lock, full
+# screen, keep-open, minimize and close.
 # -SelfTest runs the layout checks without opening any window (exit code 0 = pass).
 # -Smoke opens the viewer on the second screen for a few seconds, without direct mode, and
-# prints which renderer it used (developer check).
+# prints which renderer it used (developer check). Halfway through it opens the toolbar.
+# -SmokeOn <device> (with -Smoke) puts the viewer window on that screen instead, for
+# screenshots when other windows cover the second screen.
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -27,6 +32,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -64,6 +72,293 @@ public class SvForm : Form {
             if (t && l) hit = 13; else if (t && r) hit = 14; else if (b && l) hit = 16; else if (b && r) hit = 17;
             else if (l) hit = 10; else if (r) hit = 11; else if (t) hit = 12; else if (b) hit = 15;
             if (hit != 0) m.Result = (IntPtr)hit;
+        }
+    }
+}
+
+// Floating toolbar: a small rounded pill docked at the top centre of the viewer (or of the screen
+// in full screen). It rests as a thin handle and opens while the pointer is near it. It is a
+// per-pixel-alpha layered window, so the corners, the shadow and the translucent background are
+// anti-aliased on Windows 10 too. It never takes the focus.
+public class SvBarButton {
+    public string Id = "", Glyph = "", Tip = "";
+    public bool On, Danger, GapBefore, Visible = true;
+}
+public class SvBarClickEventArgs : EventArgs {
+    public string Id;
+    public SvBarClickEventArgs(string id) { Id = id; }
+}
+public class SvBar : Form {
+    [StructLayout(LayoutKind.Sequential, Pack = 1)] struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
+    [StructLayout(LayoutKind.Sequential)] struct PT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] struct SZ { public int W, H; }
+    [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dstDc, ref PT dst, ref SZ size, IntPtr srcDc, ref PT src, int key, ref BLENDFUNCTION blend, int flags);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr o);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+
+    public readonly List<SvBarButton> Buttons = new List<SvBarButton>();
+    public Rectangle DockRect;          // the bar is centred on the top edge of this rectangle
+    public Rectangle Limit;           // and kept inside this one (the screen)
+    public int Offset;                // horizontal offset from the anchor centre (dragging)
+    public bool KeepOpen, ForceOpen;
+    public Color Accent = Color.FromArgb(96, 170, 255);
+    public string DragTip = "";
+    public event EventHandler<SvBarClickEventArgs> ButtonClick;
+
+    readonly float k;
+    readonly Font glyphFont;
+    readonly Timer tick = new Timer();
+    readonly Stopwatch clock = Stopwatch.StartNew();
+    readonly ToolTip tip = new ToolTip();
+    float t;                          // 0 = handle, 1 = open
+    bool wantOpen;
+    long lastNear = -100000, hoverSince;
+    int hover = -1, pressed = -1;     // button index, -2 = drag grip
+    bool tipShown, dragging;
+    int dragX, dragOffset;
+    Point winPos;
+    Size winSize;
+
+    int S(float v) { return (int)Math.Round(v * k); }
+    int BtnW { get { return S(34); } }
+    int BtnH { get { return S(30); } }
+    int Pad { get { return S(5); } }
+    int GripW { get { return S(16); } }
+    int Gap { get { return S(9); } }
+    int Shadow { get { return S(10); } }
+
+    public SvBar(float scale, string glyphFamily) {
+        k = scale;
+        glyphFont = new Font(glyphFamily, S(14), GraphicsUnit.Pixel);
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        StartPosition = FormStartPosition.Manual;
+        tip.ShowAlways = true;
+        tick.Interval = 15;
+        tick.Tick += delegate { Step(); };
+    }
+    protected override CreateParams CreateParams {
+        get { CreateParams cp = base.CreateParams; cp.ExStyle |= 0x80000 | 0x80 | 0x08000000; return cp; }   // layered, tool window, no activate
+    }
+    protected override bool ShowWithoutActivation { get { return true; } }
+    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); Render(); tick.Start(); }
+    protected override void OnFormClosed(FormClosedEventArgs e) { tick.Stop(); base.OnFormClosed(e); }
+
+    // --- geometry -------------------------------------------------------------------------
+    List<SvBarButton> ShownButtons() { List<SvBarButton> l = new List<SvBarButton>(); foreach (SvBarButton b in Buttons) if (b.Visible) l.Add(b); return l; }
+    Size OpenSize() {
+        int w = Pad + GripW;
+        foreach (SvBarButton b in ShownButtons()) w += BtnW + (b.GapBefore ? Gap : 0);
+        return new Size(w + Pad, BtnH + 2 * Pad);
+    }
+    static float Ease(float v) { float u = 1 - v; return 1 - u * u * u; }
+    // Pill rectangle inside the window for the current animation state.
+    RectangleF PillRect() {
+        Size o = OpenSize();
+        float e = Ease(t);
+        float w = S(46) + (o.Width - S(46)) * e, h = S(6) + (o.Height - S(6)) * e;
+        float y = Shadow + S(2) + (S(4) - S(2)) * e;
+        return new RectangleF(Shadow + (o.Width - w) / 2f, y, w, h);
+    }
+    Rectangle ButtonRect(int i) {
+        int x = Shadow + Pad + GripW;
+        List<SvBarButton> l = ShownButtons();
+        for (int j = 0; j < l.Count; j++) {
+            if (l[j].GapBefore) x += Gap;
+            if (j == i) return new Rectangle(x, Shadow + S(4) + Pad, BtnW, BtnH);
+            x += BtnW;
+        }
+        return Rectangle.Empty;
+    }
+    Rectangle GripRect() { return new Rectangle(Shadow + Pad, Shadow + S(4) + Pad, GripW, BtnH); }
+    public Rectangle PillBounds {
+        get { RectangleF p = PillRect(); return new Rectangle(winPos.X + (int)p.X, winPos.Y + (int)p.Y, (int)p.Width, (int)p.Height); }
+    }
+    public bool IsOpen { get { return t >= 1f; } }
+
+    void Place() {
+        Size o = OpenSize();
+        winSize = new Size(o.Width + 2 * Shadow, o.Height + 2 * Shadow + S(4));
+        int x = PlaceX(DockRect.X, DockRect.Width, Limit.Left, Limit.Right, o.Width, Shadow, ref Offset);
+        winPos = new Point(x, DockRect.Top - Shadow);
+    }
+    // Left edge of the bar window: centred on the anchor plus the dragged offset, the offset kept
+    // within the anchor's top edge, and the pill kept inside the screen limits.
+    public static int PlaceX(int anchorX, int anchorW, int limitL, int limitR, int openW, int shadow, ref int offset) {
+        int half = Math.Max(0, (anchorW - openW) / 2);
+        offset = Math.Max(-half, Math.Min(half, offset));
+        int winW = openW + 2 * shadow;
+        int x = anchorX + anchorW / 2 + offset - winW / 2;
+        if (limitR > limitL) x = Math.Max(limitL - shadow, Math.Min(limitR - winW + shadow, x));
+        return x;
+    }
+
+    // --- public actions -------------------------------------------------------------------
+    public void Redraw() { if (IsHandleCreated) Render(); }
+    public void Open() { lastNear = clock.ElapsedMilliseconds; wantOpen = true; }
+    public void ShowTip(string text, string id) {
+        List<SvBarButton> l = ShownButtons();
+        for (int i = 0; i < l.Count; i++) if (l[i].Id == id) {
+            Rectangle r = ButtonRect(i);
+            tip.Show(text, this, r.X, r.Bottom + S(10), 2500);
+        }
+    }
+    public Point OpenCenter() {
+        Size o = OpenSize();
+        return new Point(winPos.X + Shadow + o.Width / 2, winPos.Y + Shadow + S(4) + o.Height / 2);
+    }
+
+    // --- behaviour ------------------------------------------------------------------------
+    void Step() {
+        if (!Visible) return;
+        long now = clock.ElapsedMilliseconds;
+        Point c = Cursor.Position;
+        Rectangle pill = PillBounds;
+        Rectangle zone = t > 0.05f ? Rectangle.Inflate(pill, S(10), S(10))
+                                   : new Rectangle(pill.X - S(18), DockRect.Top, pill.Width + S(36), S(12));
+        if (zone.Contains(c)) lastNear = now;
+        bool open = KeepOpen || ForceOpen || dragging || (now - lastNear) < 600;
+        if (open != wantOpen) wantOpen = open;
+        float target = wantOpen ? 1f : 0f;
+        bool changed = false;
+        if (t != target) {
+            float stepT = tick.Interval / 160f;
+            t = wantOpen ? Math.Min(1f, t + stepT) : Math.Max(0f, t - stepT);
+            changed = true;
+        }
+        // Hover and tooltips, only while open.
+        int h = -1;
+        if (t >= 1f) {
+            Point p = new Point(c.X - winPos.X, c.Y - winPos.Y);
+            if (GripRect().Contains(p)) h = -2;
+            List<SvBarButton> l = ShownButtons();
+            for (int i = 0; i < l.Count; i++) if (ButtonRect(i).Contains(p)) h = i;
+            if (!new Rectangle(winPos, winSize).Contains(c)) h = -1;
+        }
+        if (h != hover) {
+            hover = h; hoverSince = now; changed = true;
+            if (tipShown) { tip.Hide(this); tipShown = false; }
+            Cursor = h == -2 ? Cursors.SizeWE : (h >= 0 ? Cursors.Hand : Cursors.Default);
+        } else if (h != -1 && !tipShown && !dragging && now - hoverSince > 450) {
+            string text = h == -2 ? DragTip : ShownButtons()[h].Tip;
+            Rectangle r = h == -2 ? GripRect() : ButtonRect(h);
+            if (!string.IsNullOrEmpty(text)) { tip.Show(text, this, r.X, r.Bottom + S(10), 4000); tipShown = true; }
+        }
+        if (changed) Render();
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e) {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left || t < 1f) return;
+        if (hover == -2) { dragging = true; dragX = Cursor.Position.X; dragOffset = Offset; Capture = true; }
+        else if (hover >= 0) { pressed = hover; Render(); }
+    }
+    protected override void OnMouseMove(MouseEventArgs e) {
+        base.OnMouseMove(e);
+        if (dragging) { Offset = dragOffset + Cursor.Position.X - dragX; Render(); }
+    }
+    protected override void OnMouseUp(MouseEventArgs e) {
+        base.OnMouseUp(e);
+        if (dragging) { dragging = false; Capture = false; return; }
+        int p = pressed; pressed = -1;
+        if (p >= 0 && p == hover) {
+            Render();
+            EventHandler<SvBarClickEventArgs> h = ButtonClick;
+            if (h != null) h(this, new SvBarClickEventArgs(ShownButtons()[p].Id));
+        } else if (p >= 0) Render();
+    }
+
+    // --- drawing --------------------------------------------------------------------------
+    static GraphicsPath Round(RectangleF r, float rad) {
+        GraphicsPath g = new GraphicsPath();
+        rad = Math.Max(0.5f, Math.Min(rad, Math.Min(r.Width, r.Height) / 2f));
+        float d = rad * 2;
+        g.AddArc(r.X, r.Y, d, d, 180, 90);
+        g.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        g.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        g.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        g.CloseFigure();
+        return g;
+    }
+    static Color A(int a, Color c) { return Color.FromArgb(Math.Max(0, Math.Min(255, a)), c.R, c.G, c.B); }
+    static Color Lighter(Color c, float f) { return Color.FromArgb(c.R + (int)((255 - c.R) * f), c.G + (int)((255 - c.G) * f), c.B + (int)((255 - c.B) * f)); }
+
+    void Render() {
+        Place();
+        using (Bitmap bmp = new Bitmap(winSize.Width, winSize.Height, PixelFormat.Format32bppArgb))
+        using (Graphics g = Graphics.FromImage(bmp)) {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            g.Clear(Color.Transparent);
+            RectangleF pill = PillRect();
+            float e = Ease(t);
+            float rad = Math.Min(pill.Height / 2f, S(12));
+            // Soft shadow, slightly below the pill.
+            int sh = Math.Max(2, (int)(Shadow * (0.4f + 0.6f * e)));
+            for (int i = sh; i >= 1; i--) {
+                RectangleF r = RectangleF.Inflate(pill, i, i); r.Offset(0, S(2));
+                float f = 1f - (float)i / (sh + 1);
+                using (GraphicsPath p = Round(r, rad + i))
+                using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(16 * f * f), 0, 0, 0))) g.FillPath(b, p);
+            }
+            using (GraphicsPath p = Round(pill, rad)) {
+                Color fill = e < 0.5f ? Color.FromArgb(210, 58, 60, 66) : Color.FromArgb(236, 32, 33, 37);
+                using (SolidBrush b = new SolidBrush(fill)) g.FillPath(b, p);
+                using (Pen pen = new Pen(Color.FromArgb(e < 0.5f ? 90 : 44, 255, 255, 255), 1f)) g.DrawPath(pen, p);
+            }
+            float ca = Math.Max(0f, Math.Min(1f, (e - 0.55f) / 0.45f));   // contents fade in last
+            if (ca > 0f) {
+                int a = (int)(255 * ca);
+                // Grip: two columns of dots.
+                Rectangle gr = GripRect();
+                using (SolidBrush b = new SolidBrush(A((int)(a * (hover == -2 || dragging ? 0.85f : 0.45f)), Color.White))) {
+                    float dr = Math.Max(1.2f, k * 1.3f), cx = gr.X + gr.Width / 2f, cy = gr.Y + gr.Height / 2f;
+                    for (int row = -1; row <= 1; row++) for (int col = 0; col < 2; col++)
+                        g.FillEllipse(b, cx + (col == 0 ? -S(2.5f) : S(2.5f)) - dr, cy + row * S(5) - dr, 2 * dr, 2 * dr);
+                }
+                StringFormat sf = new StringFormat(); sf.Alignment = StringAlignment.Center; sf.LineAlignment = StringAlignment.Center;
+                List<SvBarButton> l = ShownButtons();
+                for (int i = 0; i < l.Count; i++) {
+                    SvBarButton btn = l[i];
+                    Rectangle r = ButtonRect(i);
+                    if (btn.GapBefore) {
+                        using (Pen sep = new Pen(A((int)(a * 0.16f), Color.White), 1f))
+                            g.DrawLine(sep, r.X - Gap / 2f, r.Y + S(8), r.X - Gap / 2f, r.Bottom - S(8));
+                    }
+                    RectangleF hr = RectangleF.Inflate(r, -S(2), -S(1));
+                    Color glyph = A(a, Color.FromArgb(232, 232, 236));
+                    if (btn.On) {
+                        using (GraphicsPath p = Round(hr, S(6))) using (SolidBrush b = new SolidBrush(A((int)(a * 0.28f), Accent))) g.FillPath(b, p);
+                        glyph = A(a, Lighter(Accent, 0.35f));
+                    }
+                    if (i == hover) {
+                        Color hc = btn.Danger ? Color.FromArgb(196, 43, 28) : Color.White;
+                        int ha = btn.Danger ? a : (int)(a * (pressed == i ? 0.10f : 0.14f));
+                        using (GraphicsPath p = Round(hr, S(6))) using (SolidBrush b = new SolidBrush(A(ha, hc))) g.FillPath(b, p);
+                        if (btn.Danger) glyph = A(a, Color.White);
+                    }
+                    using (SolidBrush b = new SolidBrush(glyph)) g.DrawString(btn.Glyph, glyphFont, b, new RectangleF(r.X, r.Y + (pressed == i ? 1 : 0), r.Width, r.Height), sf);
+                }
+            }
+            Push(bmp);
+        }
+    }
+
+    void Push(Bitmap bmp) {
+        IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen);
+        IntPtr hb = bmp.GetHbitmap(Color.FromArgb(0)), old = SelectObject(mem, hb);
+        try {
+            PT dst; dst.X = winPos.X; dst.Y = winPos.Y;
+            SZ size; size.W = bmp.Width; size.H = bmp.Height;
+            PT src; src.X = 0; src.Y = 0;
+            BLENDFUNCTION bf; bf.BlendOp = 0; bf.BlendFlags = 0; bf.SourceConstantAlpha = 255; bf.AlphaFormat = 1;   // AC_SRC_ALPHA
+            UpdateLayeredWindow(Handle, screen, ref dst, ref size, mem, ref src, 0, ref bf, 2);                       // ULW_ALPHA
+        } finally {
+            SelectObject(mem, old); DeleteObject(hb); DeleteDC(mem); ReleaseDC(IntPtr.Zero, screen);
         }
     }
 }
@@ -362,18 +657,6 @@ function Get-HomeRect($screens) {
     return [pscustomobject]@{ X = [int]$l; Y = [int]$t; Width = [int]($r - $l); Height = [int]($b - $t) }
 }
 
-# Where the floating toolbar goes in small mode: centered above the window, below it when there
-# is no room above, and inside its top edge when there is no room on either side.
-function Get-ToolbarPlacement($win, [int]$tbW, [int]$tbH, $area, [int]$gap) {
-    $x = [int]($win.X + ($win.Width - $tbW) / 2)
-    $x = [Math]::Max($area.X, [Math]::Min($area.X + $area.Width - $tbW, $x))
-    $above = $win.Y - $tbH - $gap
-    if ($above -ge $area.Y) { return [pscustomobject]@{ X = $x; Y = $above; Side = 'above' } }
-    $below = $win.Y + $win.Height + $gap
-    if ($below + $tbH -le $area.Y + $area.Height) { return [pscustomobject]@{ X = $x; Y = $below; Side = 'below' } }
-    return [pscustomobject]@{ X = $x; Y = $win.Y + $gap; Side = 'inside' }
-}
-
 # How hard the hand pushes past an edge where Windows holds the cursor still (the outer edges
 # of the desktop). $x,$y is the cursor on screen $bounds; $rawX,$rawY is the raw mouse motion
 # since the last tick; $push is the previous result. Moving back inward resets the push; a
@@ -418,14 +701,16 @@ if ($SelfTest) {
     Check ($lb.X -eq 0 -and $lb.Y -eq 60 -and $lb.W -eq 640 -and $lb.H -eq 360) "letterbox 4:3 got=$($lb.X),$($lb.Y),$($lb.W),$($lb.H)"
     $lb = Get-LetterBox 1920 1080 ([pscustomobject]@{ X = 2400; Y = 0; Width = 2400; Height = 1350 })
     Check ($lb.X -eq 0 -and $lb.Y -eq 0 -and $lb.W -eq 1920 -and $lb.H -eq 1080 -and [Math]::Abs($lb.Scale - 0.8) -lt 0.0001) "letterbox full got=$($lb.X),$($lb.Y),$($lb.W),$($lb.H),$($lb.Scale)"
-    # Toolbar: above the window, below when the window touches the top, inside when it fills the area.
-    $area = [pscustomobject]@{ X = 0; Y = 0; Width = 1920; Height = 1040 }
-    $p = Get-ToolbarPlacement ([pscustomobject]@{ X = 1200; Y = 600; Width = 600; Height = 380 }) 300 40 $area 4
-    Check ($p.Side -eq 'above' -and $p.X -eq 1350 -and $p.Y -eq 556) "toolbar above got=$($p.Side),$($p.X),$($p.Y)"
-    $p = Get-ToolbarPlacement ([pscustomobject]@{ X = 1700; Y = 10; Width = 600; Height = 380 }) 300 40 $area 4
-    Check ($p.Side -eq 'below' -and $p.X -eq 1620 -and $p.Y -eq 394) "toolbar below, clamped got=$($p.Side),$($p.X),$($p.Y)"
-    $p = Get-ToolbarPlacement ([pscustomobject]@{ X = 0; Y = 0; Width = 1920; Height = 1040 }) 300 40 $area 4
-    Check ($p.Side -eq 'inside' -and $p.Y -eq 4) "toolbar inside got=$($p.Side),$($p.X),$($p.Y)"
+    # Toolbar: centred on the window's top edge, slid by dragging only along that edge, and kept
+    # on the screen. Arguments: anchor x, width, screen left, right, pill width, shadow, offset.
+    $o = 0;    $x = [SvBar]::PlaceX(1000, 800, 0, 1920, 300, 10, [ref]$o)
+    Check ($x -eq 1240 -and $o -eq 0) "bar centred got=$x off=$o"
+    $o = 900;  $x = [SvBar]::PlaceX(1000, 800, 0, 1920, 300, 10, [ref]$o)
+    Check ($x -eq 1490 -and $o -eq 250) "bar slid, offset clamped to the edge got=$x off=$o"
+    $o = -60;  $x = [SvBar]::PlaceX(1000, 200, 0, 1920, 300, 10, [ref]$o)
+    Check ($x -eq 940 -and $o -eq 0) "bar wider than the window stays centred got=$x off=$o"
+    $o = 0;    $x = [SvBar]::PlaceX(1800, 300, 0, 1920, 300, 10, [ref]$o)
+    Check ($x -eq 1610 -and $o -eq 0) "bar kept inside the screen got=$x off=$o"
     # Edge push: Windows stops the cursor at the outer edges of the desktop, so only the raw
     # mouse motion shows that the hand keeps pushing outward.
     $zero = [pscustomobject]@{ X = 0; Y = 0 }
@@ -487,13 +772,7 @@ function Px([double]$v) { [int][Math]::Round($v * $k) }
 
 $cWindow = [Drawing.Color]::FromArgb(24, 24, 26)
 $cBar    = [Drawing.Color]::FromArgb(36, 36, 40)
-$cHover  = [Drawing.Color]::FromArgb(64, 64, 70)
-$cText   = [Drawing.Color]::FromArgb(232, 232, 232)
 $cDim    = [Drawing.Color]::FromArgb(150, 150, 156)
-$cOn     = [Drawing.Color]::FromArgb(96, 170, 255)
-$cClose  = [Drawing.Color]::FromArgb(196, 43, 28)
-$glyphFont = New-Object Drawing.Font('Segoe MDL2 Assets', [single](Px 12), [Drawing.GraphicsUnit]::Pixel)
-$textFont  = New-Object Drawing.Font('Segoe UI', [single](Px 12), [Drawing.GraphicsUnit]::Pixel)
 
 # --- state ----------------------------------------------------------------------------------
 $script:remote = $false
@@ -508,7 +787,7 @@ $script:full = $false
 $script:normalBounds = $null
 $script:onTop = $true
 $script:showPointer = $true
-$script:userHid = $false
+$script:keepBar = $false
 $script:muted = @()
 $script:mag = [IntPtr]::Zero
 $script:magOk = $false
@@ -516,7 +795,6 @@ $script:pic = $null
 $script:magBounds = $null
 $script:clock = [Diagnostics.Stopwatch]::StartNew()
 $script:lastFrameMs = -1000
-$script:tbLastNear = 0
 $script:lockOn = $true
 $script:clipMine = $false
 $script:homeRect = $null
@@ -538,24 +816,17 @@ $primary = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $form.Location = New-Object Drawing.Point(($primary.Right - $form.Width - (Px 20)), ($primary.Bottom - $form.Height - (Px 20)))
 if ($Smoke) {
     $sb = $screen.Bounds
+    if ($SmokeOn) { $on = [Windows.Forms.Screen]::AllScreens | Where-Object { $_.DeviceName -eq $SmokeOn } | Select-Object -First 1; if ($on) { $sb = $on.Bounds } }
     $form.Location = New-Object Drawing.Point(($sb.Right - $form.Width - (Px 40)), ($sb.Bottom - $form.Height - (Px 60)))
 }
 Write-ViewerLog "start dpi=$($script:dpiMode) scale=$k second=$($screen.Bounds)"
 
-# Thin strip on top: drag it to move the window; hover it to bring back a hidden toolbar.
+# Thin strip on top: drag it to move the window; hovering it opens the toolbar.
 $grip = New-Object Windows.Forms.Panel
 $grip.Dock = 'Top'
 $grip.Height = Px 10
 $grip.BackColor = $cBar
 $grip.Cursor = [Windows.Forms.Cursors]::SizeAll
-$grip.Add_Paint({
-    param($sender, $e)
-    $w = Px 36; $h = [Math]::Max(2, (Px 3))
-    $x = [int](($grip.Width - $w) / 2); $y = [int](($grip.Height - $h) / 2)
-    $brush = New-Object Drawing.SolidBrush($cDim)
-    $e.Graphics.FillRectangle($brush, $x, $y, $w, $h)
-    $brush.Dispose()
-})
 $grip.Add_MouseDown({ param($sender, $e) if ($e.Button -eq 'Left') { [SvForm]::DragMove($form) } })
 $grip.Add_MouseEnter({ Show-Toolbar })
 
@@ -566,125 +837,96 @@ $form.Controls.Add($view)
 $form.Controls.Add($grip)
 
 # --- floating toolbar -----------------------------------------------------------------------
-$tb = New-Object SvForm
-$tb.Resizable = $false
-$tb.NoActivate = $true
-$tb.FormBorderStyle = 'None'
-$tb.ShowInTaskbar = $false
-$tb.StartPosition = 'Manual'
-$tb.BackColor = $cBar
-$tip = New-Object Windows.Forms.ToolTip
+# Accent: the Windows accent colour when it is a real colour, otherwise a calm blue (a grey
+# accent would not mark a pressed toggle on the dark bar).
+function Get-AccentColor {
+    try {
+        $v = [uint32](Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\DWM' -ErrorAction Stop).AccentColor
+        $c = [Drawing.Color]::FromArgb([int]($v -band 0xFF), [int](($v -shr 8) -band 0xFF), [int](($v -shr 16) -band 0xFF))
+        if ($c.GetSaturation() -ge 0.3 -and $c.GetBrightness() -ge 0.25) { return $c }
+    } catch {}
+    return [Drawing.Color]::FromArgb(76, 160, 255)
+}
+$glyphFamily = if ((New-Object Drawing.Text.InstalledFontCollection).Families | Where-Object { $_.Name -eq 'Segoe Fluent Icons' }) { 'Segoe Fluent Icons' } else { 'Segoe MDL2 Assets' }
+$bar = New-Object SvBar([single]$k, $glyphFamily)
+$bar.Accent = Get-AccentColor
 
-$flow = New-Object Windows.Forms.FlowLayoutPanel
-$flow.WrapContents = $false
-$flow.AutoSize = $true
-$flow.AutoSizeMode = 'GrowAndShrink'
-$flow.Padding = New-Object Windows.Forms.Padding((Px 8), (Px 3), (Px 4), (Px 3))
-$flow.BackColor = $cBar
-$tb.Controls.Add($flow)
-
-$title = New-Object Windows.Forms.Label
-$title.Text = "Second screen"
-$title.Font = $textFont
-$title.ForeColor = $cDim
-$title.AutoSize = $false
-$title.Size = New-Object Drawing.Size((Px 96), (Px 28))
-$title.TextAlign = 'MiddleLeft'
-$title.Margin = New-Object Windows.Forms.Padding(0, 0, (Px 4), 0)
-$title.Cursor = [Windows.Forms.Cursors]::SizeAll
-$title.Add_MouseDown({ param($sender, $e) if ($e.Button -eq 'Left' -and -not $script:full) { [SvForm]::DragMove($form) } })
-$flow.Controls.Add($title)
-
-function New-ToolButton([string]$tipText, [scriptblock]$onClick, [Drawing.Color]$hoverColor) {
-    $b = New-Object Windows.Forms.Label
-    $b.AutoSize = $false
-    $b.Size = New-Object Drawing.Size((Px 32), (Px 28))
-    $b.TextAlign = 'MiddleCenter'
-    $b.Font = $glyphFont
-    $b.ForeColor = $cText
-    $b.BackColor = $cBar
-    $b.Margin = New-Object Windows.Forms.Padding((Px 1), 0, (Px 1), 0)
-    $b.Cursor = [Windows.Forms.Cursors]::Hand
-    $b.Tag = $hoverColor
-    $b.Add_MouseEnter({ param($sender, $e) $sender.BackColor = $sender.Tag })
-    $b.Add_MouseLeave({ param($sender, $e) $sender.BackColor = $cBar })
-    $b.Add_Click($onClick)
-    $tip.SetToolTip($b, $tipText)
-    $flow.Controls.Add($b)
+function New-BarButton([string]$id, [bool]$gap = $false, [bool]$danger = $false) {
+    $b = New-Object SvBarButton
+    $b.Id = $id; $b.GapBefore = $gap; $b.Danger = $danger
+    $bar.Buttons.Add($b)
     return $b
 }
-
-$btnPin     = New-ToolButton "Always on top" { $script:onTop = -not $script:onTop; $form.TopMost = $script:onTop; Update-Glyphs } $cHover
-$btnPointer = New-ToolButton "Show the pointer in the image" { Switch-Pointer } $cHover
-$btnMute    = New-ToolButton "Mute the apps on the second screen" { Switch-Mute } $cHover
-$btnLock    = New-ToolButton "Keep the mouse on the main screen" { Switch-Lock } $cHover
-$btnFull    = New-ToolButton "Full screen" { Set-Fullscreen (-not $script:full) } $cHover
-$btnHide    = New-ToolButton "Hide this bar (hover the top edge to bring it back)" { Switch-HideBar } $cHover
-$btnMin     = New-ToolButton "Minimize" { $form.WindowState = 'Minimized' } $cHover
-$btnClose   = New-ToolButton "Close" { $form.Close() } $cClose
-
-function Set-Rounded($f, [int]$r) {
-    $path = New-Object Drawing.Drawing2D.GraphicsPath
-    $w = $f.Width; $h = $f.Height; $d = 2 * $r
-    $path.AddArc(0, 0, $d, $d, 180, 90)
-    $path.AddArc($w - $d, 0, $d, $d, 270, 90)
-    $path.AddArc($w - $d, $h - $d, $d, $d, 0, 90)
-    $path.AddArc(0, $h - $d, $d, $d, 90, 90)
-    $path.CloseFigure()
-    $f.Region = New-Object Drawing.Region($path)
-}
+$btnPin     = New-BarButton 'pin'
+$btnPointer = New-BarButton 'pointer'
+$btnMute    = New-BarButton 'mute'
+$btnLock    = New-BarButton 'lock'
+$btnFull    = New-BarButton 'full' $true
+$btnKeep    = New-BarButton 'keep'
+$btnMin     = New-BarButton 'min' $true
+$btnClose   = New-BarButton 'close' $false $true
+$bar.Add_ButtonClick({
+    param($sender, $e)
+    switch ($e.Id) {
+        'pin'     { $script:onTop = -not $script:onTop; $form.TopMost = $script:onTop; Update-Glyphs }
+        'pointer' { Switch-Pointer }
+        'mute'    { Switch-Mute }
+        'lock'    { Switch-Lock }
+        'full'    { Set-Fullscreen (-not $script:full) }
+        'keep'    { Switch-KeepBar }
+        'min'     { $form.WindowState = 'Minimized' }
+        'close'   { $form.Close() }
+    }
+})
 
 function Update-ToolbarSize {
-    $btnPin.Visible = -not $script:full
-    $title.Visible = -not $script:full
-    $flow.PerformLayout()
-    $tb.ClientSize = $flow.PreferredSize
-    Set-Rounded $tb (Px 8)
+    $btnPin.Visible = -not $script:full   # "always on top" only exists for the small window
+    $bar.Redraw()
 }
 
 function Update-Glyphs {
-    $btnPin.Text = if ($script:onTop) { [string][char]0xE718 } else { [string][char]0xE77A }
-    $btnPin.ForeColor = if ($script:onTop) { $cOn } else { $cText }
-    $tip.SetToolTip($btnPin, $(if ($script:onTop) { "Always on top: on" } else { "Always on top: off" }))
-    $btnPointer.Text = [string][char]0xE7C9
-    $btnPointer.ForeColor = if ($script:showPointer) { $cOn } else { $cText }
-    $tip.SetToolTip($btnPointer, $(if ($script:showPointer) { "Pointer shown in the image (turn off when an app draws its own)" } else { "Pointer hidden in the image" }))
-    $btnMute.Text = if ($script:muted.Count) { [string][char]0xE74F } else { [string][char]0xE767 }
-    $btnMute.ForeColor = if ($script:muted.Count) { $cOn } else { $cText }
-    $btnLock.Text = if ($script:lockOn) { [string][char]0xE72E } else { [string][char]0xE785 }
-    $btnLock.ForeColor = if ($script:lockOn -and $script:homeRect) { $cOn } else { $cText }
-    $tip.SetToolTip($btnLock, $(if (-not $script:homeRect) { "Mouse lock: not needed or not possible with this screen layout" } elseif ($script:lockOn) { "Mouse kept on the main screen (drag a window or use the image to cross): on" } else { "Mouse kept on the main screen: off" }))
-    $btnFull.Text = if ($script:full) { [string][char]0xE73F } else { [string][char]0xE740 }
-    $tip.SetToolTip($btnFull, $(if ($script:full) { "Back to the small window" } else { "Full screen" }))
-    $btnHide.Text = if ($script:userHid -and -not $script:full) { [string][char]0xE70D } else { [string][char]0xE70E }
-    $tip.SetToolTip($btnHide, $(if ($script:userHid -and -not $script:full) { "Keep this bar visible" } else { "Hide this bar (hover the top edge to bring it back)" }))
-    $btnMin.Text = [string][char]0xE921
-    $btnClose.Text = [string][char]0xE8BB
+    $btnPin.Glyph = [string][char]0xE81E
+    $btnPin.On = $script:onTop
+    $btnPin.Tip = if ($script:onTop) { "Always on top: on" } else { "Always on top: off" }
+    $btnPointer.Glyph = [string][char]0xE8B0
+    $btnPointer.On = $script:showPointer
+    $btnPointer.Tip = if ($script:showPointer) { "Pointer shown in the image (turn off when an app draws its own)" } else { "Pointer hidden in the image" }
+    $btnMute.Glyph = if ($script:muted.Count) { [string][char]0xE74F } else { [string][char]0xE767 }
+    $btnMute.On = [bool]$script:muted.Count
+    $btnMute.Tip = if ($script:muted.Count) { "Apps on the second screen muted: click to unmute" } else { "Mute the apps on the second screen" }
+    $btnLock.Glyph = if ($script:lockOn) { [string][char]0xE72E } else { [string][char]0xE785 }
+    $btnLock.On = [bool]($script:lockOn -and $script:homeRect)
+    $btnLock.Tip = if (-not $script:homeRect) { "Mouse lock: not needed or not possible with this screen layout" } elseif ($script:lockOn) { "Mouse kept on the main screen (drag a window or use the image to cross): on" } else { "Mouse kept on the main screen: off" }
+    $btnFull.Glyph = if ($script:full) { [string][char]0xE73F } else { [string][char]0xE740 }
+    $btnFull.Tip = if ($script:full) { "Back to the small window" } else { "Full screen" }
+    $btnKeep.Glyph = [string][char]0xE840
+    $btnKeep.On = $script:keepBar
+    $btnKeep.Tip = if ($script:keepBar) { "Bar kept open: click to let it fold into the handle" } else { "Keep this bar open" }
+    $btnMin.Glyph = [string][char]0xE921
+    $btnMin.Tip = "Minimize"
+    $btnClose.Glyph = [string][char]0xE8BB
+    $btnClose.Tip = "Close"
+    $bar.KeepOpen = $script:keepBar
+    $bar.Redraw()
 }
 
 function Update-ToolbarPlacement {
-    if ($script:full) {
-        $sb = [Windows.Forms.Screen]::FromControl($form).Bounds
-        $tb.Location = New-Object Drawing.Point(([int]($sb.X + ($sb.Width - $tb.Width) / 2)), ($sb.Y + (Px 8)))
-    } else {
-        $area = [Windows.Forms.Screen]::FromControl($form).WorkingArea
-        $p = Get-ToolbarPlacement $form.Bounds $tb.Width $tb.Height $area (Px 4)
-        $tb.Location = New-Object Drawing.Point($p.X, $p.Y)
-    }
+    $sc = [Windows.Forms.Screen]::FromControl($form)
+    $bar.DockRect = $form.Bounds
+    $bar.Limit = $sc.Bounds
+    $bar.Redraw()
 }
 
 function Show-Toolbar {
     if ($form.WindowState -eq 'Minimized') { return }
     Update-ToolbarPlacement
-    if (-not $tb.Visible) { $tb.Show($form) }
-    $script:tbLastNear = $script:clock.ElapsedMilliseconds
+    if (-not $bar.Visible) { $bar.Show($form) }
+    $bar.Open()
 }
 
-function Switch-HideBar {
-    if ($script:full) { $tb.Hide(); return }
-    $script:userHid = -not $script:userHid
+function Switch-KeepBar {
+    $script:keepBar = -not $script:keepBar
     Update-Glyphs
-    if ($script:userHid) { $tb.Hide() } else { Show-Toolbar }
 }
 
 function Set-Fullscreen([bool]$on) {
@@ -710,7 +952,7 @@ function Set-Fullscreen([bool]$on) {
     Update-ToolbarSize
     Update-Glyphs
     Update-MagLayout
-    if ($script:full -or -not $script:userHid) { Show-Toolbar } else { $tb.Hide() }
+    Show-Toolbar
 }
 
 # --- cursor lock ----------------------------------------------------------------------------
@@ -815,7 +1057,7 @@ function Switch-Mute {
             $n = [SvAudio]::SetMute($names, $true)
             Write-ViewerLog "muted sessions=$n apps=$($names -join ',')"
             if ($n -gt 0) { $script:muted = @($names) }
-            else { $tip.Show("No sound found from the apps on the second screen", $btnMute, 0, $btnMute.Height, 2500) }
+            else { $bar.ShowTip("No sound found from the apps on the second screen", 'mute') }
         }
     } catch { Write-ViewerLog "mute failed: $($_.Exception.Message)" }
     Update-Glyphs
@@ -865,11 +1107,10 @@ function Update-GdiFrame($b) {
 }
 
 $view.Add_Resize({ Update-MagLayout })
-$form.Add_LocationChanged({ if ($tb.Visible) { Update-ToolbarPlacement } })
+$form.Add_LocationChanged({ if ($bar.Visible) { Update-ToolbarPlacement } })
 $form.Add_SizeChanged({
-    if ($form.WindowState -eq 'Minimized') { return }
-    if ($tb.Visible) { Update-ToolbarPlacement }
-    elseif (-not $script:full -and -not $script:userHid) { Show-Toolbar }
+    if ($form.WindowState -eq 'Minimized') { if ($bar.Visible) { $bar.Hide() }; return }
+    if ($bar.Visible) { Update-ToolbarPlacement } else { Show-Toolbar }
 })
 
 # --- direct mode ----------------------------------------------------------------------------
@@ -880,7 +1121,7 @@ $form.Add_SizeChanged({
 $script:input = New-Object SvInput
 Write-ViewerLog "raw input=$($script:input.RawOk) hotkey Ctrl+Alt+Q=$($script:input.HotkeyOk)"
 $hintText = if ($script:input.HotkeyOk) { "Move over the image to use the second screen; push past any edge or press Ctrl+Alt+Q to come back" } else { "Move over the image to use the second screen; push past any edge to come back" }
-$tip.SetToolTip($title, $hintText)
+$bar.DragTip = "Drag to slide the bar along the top edge. $hintText"
 
 function Test-OverImage($cur) {
     $pt = New-Object SvPt; $pt.X = $cur.X; $pt.Y = $cur.Y
@@ -912,7 +1153,7 @@ function Exit-Remote($b, $overX, $overY) {
     if ($script:full) {
         # The image covers the whole screen: come back onto the toolbar.
         Show-Toolbar
-        $c = $tb.PointToScreen((New-Object Drawing.Point([int]($tb.ClientSize.Width / 2), [int]($tb.ClientSize.Height / 2))))
+        $c = $bar.OpenCenter()
         [SvNative]::SetCursorPos($c.X, $c.Y) | Out-Null
     } else {
         $v = Convert-ScreenToView ([Math]::Max($b.Left, [Math]::Min($b.Right - 1, $script:px))) ([Math]::Max($b.Top, [Math]::Min($b.Bottom - 1, $script:py))) $view.ClientSize.Width $view.ClientSize.Height $b
@@ -990,17 +1231,6 @@ $timer.Add_Tick({
 
     Update-CursorLock $now
 
-    # Toolbar auto-hide: always in full screen, in small mode only after the owner hid it.
-    if ($tb.Visible -and ($script:full -or $script:userHid)) {
-        $near = $tb.Bounds.Contains($cur)
-        if (-not $near -and -not $script:full) { $near = $grip.RectangleToScreen($grip.ClientRectangle).Contains($cur) }
-        if ($near) { $script:tbLastNear = $now }
-        elseif (($now - $script:tbLastNear) -gt 1500) { $tb.Hide() }
-    } elseif (-not $tb.Visible -and $script:full -and -not $script:remote) {
-        $sb = [Windows.Forms.Screen]::FromControl($form).Bounds
-        if ($cur.Y -le $sb.Top + 1 -and $sb.Contains($cur)) { Show-Toolbar }
-    }
-
     # Faster ticks while the cursor is driven or the image fills the screen.
     $want = if ($script:remote) { 8 } else { 16 }
     if ($timer.Interval -ne $want) { $timer.Interval = $want }
@@ -1037,7 +1267,7 @@ $form.Add_Shown({
             $script:stop.Stop()
             $s = Get-SecondScreen
             $b = $s.Bounds
-            Write-ViewerLog "smoke toolbar=$($tb.Bounds) visible=$($tb.Visible) form=$($form.Bounds)"
+            Write-ViewerLog "smoke toolbar=$($bar.PillBounds) open=$($bar.IsOpen) visible=$($bar.Visible) form=$($form.Bounds)"
             try {
                 $names = [SvAudio]::ProcessNamesOn($b.X, $b.Y, $b.Width, $b.Height, $PID)
                 $n = [SvAudio]::SetMute([string[]]@(), $false)
@@ -1046,6 +1276,11 @@ $form.Add_Shown({
             $form.Close()
         })
         $script:stop.Start()
+        # Halfway through, open the toolbar so both of its states can be checked.
+        $script:half = New-Object Windows.Forms.Timer
+        $script:half.Interval = [Math]::Max(1, [int]($SmokeSeconds * 500))
+        $script:half.Add_Tick({ $script:half.Stop(); $bar.ForceOpen = $true; Write-ViewerLog "smoke toolbar opened" })
+        $script:half.Start()
     }
 })
 $form.Add_FormClosed({
