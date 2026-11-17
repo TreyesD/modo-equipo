@@ -3,6 +3,9 @@
 Run from the repository root:  python -m unittest discover -s tests -v
 """
 import binascii
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import re
@@ -285,6 +288,150 @@ class DsuServer(unittest.TestCase):
                         proc.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         proc.kill()
+
+
+def load_offscreen():
+    path = os.path.join(SCRIPTS, "second-screen", "launch_offscreen.py")
+    spec = importlib.util.spec_from_file_location("launch_offscreen", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class LaunchOffscreen(unittest.TestCase):
+    """Portable checks of launch_offscreen.py; they pass on every OS."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_offscreen()
+
+    def call(self, argv, platform):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = self.m.main(argv, platform=platform)
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)  # always exactly one JSON line
+        return code, json.loads(lines[0])
+
+    def test_parses_options_and_keeps_the_command_untouched(self):
+        ns = self.m.parse_args(["--screen", "2", "--timeout", "5", "--keep-watch", "0", "--",
+                                "app.exe", "--screen", "auto", "--"])
+        self.assertEqual((ns.screen, ns.timeout, ns.keep_watch), (2, 5.0, 0.0))
+        self.assertEqual(ns.command, ["app.exe", "--screen", "auto", "--"])
+        ns = self.m.parse_args(["--", "notepad.exe"])
+        self.assertEqual((ns.screen, ns.timeout, ns.keep_watch, ns.trace), ("auto", 15.0, 10.0, False))
+        self.assertTrue(self.m.parse_args(["--list"]).list)
+
+    def test_bad_arguments_are_usage_errors_with_exit_2(self):
+        for argv in ([], ["--screen", "x", "--", "a"], ["--screen", "-1", "--", "a"],
+                     ["--timeout", "0", "--", "a"], ["--keep-watch", "-1", "--", "a"], ["--bogus", "--", "a"]):
+            code, out = self.call(argv, "win32")
+            self.assertEqual(code, 2, argv)
+            self.assertEqual((out["ok"], out["reason"]), (False, "usage"), argv)
+
+    def test_refuses_on_non_windows_with_exit_3(self):
+        for platform in ("darwin", "linux"):
+            code, out = self.call(["--", "app"], platform)
+            self.assertEqual(code, 3)
+            self.assertEqual((out["ok"], out["reason"]), (False, "windows-only"))
+
+    @unittest.skipIf(sys.platform == "win32", "real non-Windows run")
+    def test_runs_as_a_script_on_this_system(self):
+        out = run(os.path.join("second-screen", "launch_offscreen.py"), "--", "true")
+        self.assertEqual(out.returncode, 3, out.stderr)
+        self.assertEqual(json.loads(out.stdout)["reason"], "windows-only")
+
+    def test_screen_choice(self):
+        screens = [{"primary": True}, {"primary": False, "id": "a"}, {"primary": False, "id": "b"}]
+        self.assertEqual(self.m.choose_screen(screens, "auto")["id"], "a")
+        self.assertEqual(self.m.choose_screen(screens, 2)["id"], "b")
+        self.assertIsNone(self.m.choose_screen(screens[:1], "auto"))
+        for bad in (0, 3):
+            with self.assertRaises(self.m.UsageError):
+                self.m.choose_screen(screens, bad)
+
+    def test_placement_is_centered_and_clamped_to_the_work_area(self):
+        work = (1920, 0, 3840, 1040)
+        self.assertEqual(self.m.placement_rect(800, 600, work), (2480, 220, 3280, 820))
+        self.assertEqual(self.m.placement_rect(5000, 5000, work), work)
+        self.assertTrue(self.m.intersects((0, 0, 10, 10), (9, 9, 20, 20)))
+        self.assertFalse(self.m.intersects((0, 0, 1920, 1080), (1920, 0, 3840, 1080)))  # edge only
+
+
+def _second_screen_present():
+    if sys.platform != "win32":
+        return False
+    out = run(os.path.join("second-screen", "launch_offscreen.py"), "--list")
+    return out.returncode == 0 and any(not s["primary"] for s in json.loads(out.stdout)["screens"])
+
+
+@unittest.skipUnless(_second_screen_present(), "needs Windows with a second screen")
+class LaunchOffscreenLive(unittest.TestCase):
+    """Opens notepad.exe on the second screen. Never shown on the primary, no input, no focus."""
+
+    NOTEPAD_KEY = r"Software\Microsoft\Notepad"
+
+    def notepad_settings(self):
+        import winreg
+        values = {}
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.NOTEPAD_KEY) as k:
+                i = 0
+                while True:
+                    try:
+                        name, data, kind = winreg.EnumValue(k, i)
+                    except OSError:
+                        return values
+                    values[name] = (data, kind)
+                    i += 1
+        except FileNotFoundError:
+            return None
+
+    def restore_notepad_settings(self, saved):
+        # Notepad saves its window position on close; put the user's values back.
+        import winreg
+        if saved is None:
+            with contextlib.suppress(OSError):
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, self.NOTEPAD_KEY)
+            return
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, self.NOTEPAD_KEY) as k:
+            for name in set(self.notepad_settings() or {}) - set(saved):
+                winreg.DeleteValue(k, name)
+            for name, (data, kind) in saved.items():
+                winreg.SetValueEx(k, name, 0, kind, data)
+
+    def test_notepad_never_touches_the_primary_screen(self):
+        m = load_offscreen()
+        m.set_dpi_aware()
+        primary = next(s for s in m.list_screens() if s["primary"])["rect"]
+        saved = self.notepad_settings()
+        self.addCleanup(self.restore_notepad_settings, saved)
+        out = run(os.path.join("second-screen", "launch_offscreen.py"), "--timeout", "10", "--keep-watch", "3",
+                  "--trace", "--", "notepad.exe")
+        result = json.loads(out.stdout)
+        pids = set(result.get("pids", []))
+        self.addCleanup(self.close_windows, m, pids)
+        if not result.get("windows"):
+            self.skipTest("notepad.exe opened no window of its own process tree here (packaged Notepad?)")
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertEqual(result["guardHits"], [])
+        shown = [e for e in result["trace"] if e["visible"] and not e["minimized"]]
+        self.assertTrue(shown)
+        self.assertEqual([e for e in shown if m.intersects(e["rect"], primary)], [])
+        for h in m.top_level_windows(pids):
+            if not m.U.IsIconic(h):
+                self.assertFalse(m.intersects(m.window_rect(h), primary))
+
+    @staticmethod
+    def close_windows(m, pids):
+        WM_CLOSE = 0x10
+        for h in m.top_level_windows(pids):
+            m.U.PostMessageW(h, WM_CLOSE, 0, 0)  # a message, not input: no focus change
+        deadline = time.time() + 5
+        while time.time() < deadline and m.top_level_windows(pids):
+            time.sleep(0.2)
+        for pid in pids:  # last resort if a window refused to close
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
 
 
 if __name__ == "__main__":

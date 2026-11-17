@@ -1,6 +1,6 @@
 # Referencia de scripts
 
-**Respuesta corta:** la skill trae 8 scripts. Los de Python funcionan en Windows, macOS y Linux; los de PowerShell son solo para Windows (segunda pantalla). Ninguno se conecta a internet ni instala nada.
+**Respuesta corta:** la skill trae 11 scripts. Los de Python funcionan en Windows, macOS y Linux, salvo `launch_offscreen.py`; los de segunda pantalla son solo para Windows. Ninguno se conecta a internet ni instala nada.
 
 Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). En la skill se escriben como `${CLAUDE_SKILL_DIR}/...`. `PY` significa el comando de Python que funcione: `py -3` o `python` en Windows, `python3` o `python` en macOS/Linux.
 
@@ -12,6 +12,7 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 | [`scripts/virtual-pad/dsu_server.py`](#virtual-paddsu_serverpy) | Todos | Control de juego virtual para emuladores |
 | [`scripts/second-screen/detect.ps1`](#second-screendetectps1) | Windows | ¿Hay segunda pantalla? |
 | [`scripts/second-screen/launch-on-second-screen.ps1`](#second-screenlaunch-on-second-screenps1) | Windows | Abrir el corredor de pruebas en la segunda pantalla |
+| [`scripts/second-screen/launch_offscreen.py`](#second-screenlaunch_offscreenpy) | Windows | Abrir cualquier programa directo en la segunda pantalla, sin destello en la principal |
 | [`scripts/second-screen/run-tests.ps1`](#second-screenrun-testsps1) | Windows | Detectar y ejecutar las suites de prueba |
 | [`scripts/second-screen/screen-viewer.ps1`](#second-screenscreen-viewerps1) | Windows | Visor táctil de la segunda pantalla |
 | [`scripts/second-screen/open-viewer.ps1`](#second-screenopen-viewerps1) | Windows | Crear la pantalla virtual si falta y abrir el visor |
@@ -85,6 +86,29 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 - Código 0 e imprime `LAUNCHED pid=<n> screen=<nombre>`: lanzó `run-tests.ps1` en la segunda pantalla.
 - Código 2 e imprime `NO_SECOND_SCREEN`: no lanzó nada; correr las pruebas de la forma normal.
 - Respeta `MODO_EQUIPO_NO_SECOND_SCREEN=1`.
+
+## second-screen/launch_offscreen.py
+
+**En simple:** abre cualquier programa con ventana (emulador, juego, app de escritorio) directo en la segunda pantalla. Ninguna de sus ventanas se ve en tu pantalla principal, ni por un instante. Es la forma por defecto de abrir un programa de prueba con ventana en Windows.
+
+**Contrato:**
+- Uso: `PY -I scripts/second-screen/launch_offscreen.py [--screen N|auto] [--timeout S] [--keep-watch S] [--trace] -- <exe> [args...]`. Todo lo que va después de `--` es el comando, tal cual.
+- `--list`: imprime las pantallas (`index`, `name`, `primary`, `rect`, `work`) para elegir `--screen N` (debe ser una no primaria). `auto` (por defecto) usa la primera no primaria.
+- `--timeout` (15 s): espera máxima a la primera ventana. `--keep-watch` (10 s): sigue vigilando ventanas nuevas (diálogos, ventanas de procesos hijos) ese tiempo después de la primera. `--trace`: agrega cada evento de ventana observado.
+- Método: crea el proceso suspendido y minimizado sin activar (`CREATE_SUSPENDED`, `SW_SHOWMINNOACTIVE`), engancha un `SetWinEventHook` fuera de proceso antes de reanudarlo y, en la primera aparición, fija la posición restaurada en la segunda pantalla (`SetWindowPlacement`, `SW_SHOWNOACTIVATE`). Guardia: cualquier ventana visible que toque la principal se vuelve transparente, se mueve y vuelve a ser opaca. Trabaja en píxeles reales (DPI por monitor). Sigue también a los procesos hijos.
+- No envía teclas ni clics, no toma el foco, no inyecta código ni cambia la configuración de pantallas. No espera a que el programa termine.
+- Salida: una línea JSON con `ok`, `pid`, `pids`, `screen`, `windows` (cada una con `how` = `restored` \| `moved` \| `already-off-primary`), `guardHits`, `openWindows`, `onPrimaryAtEnd`, `timedOut`, `exited`.
+
+| Código | Significado |
+|---|---|
+| 0 | Lanzado y en la segunda pantalla |
+| 1 | No se pudo lanzar (`error`, `winerror`) |
+| 2 | Error de uso |
+| 3 | No es Windows: `{"ok":false,"reason":"windows-only"}`. En macOS/Linux, correr headless o de la forma normal |
+| 4 | No hay segunda pantalla: lo abrió de la forma normal |
+| 5 | Una ventana quedó en la pantalla principal al final: detener esa prueba y arreglarla |
+
+- Límites: mientras arranca minimizado aparece un botón en la barra de tareas unos 0,3 s. Apps que restauran su propia geometría guardada pueden necesitar un ajuste propio antes de lanzar (por ejemplo, la geometría de ventana en `Qt.ini` de Dolphin). Apps que delegan en otro proceso que no es hijo (apps empaquetadas, instancia única ya abierta) no se siguen. Un `moved` en `guardHits` significa que la ventana pudo verse un instante: tratarlo como fallo de la regla.
 
 ## second-screen/run-tests.ps1
 
