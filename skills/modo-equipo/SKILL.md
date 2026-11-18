@@ -256,18 +256,16 @@ Session names: `<project> - coordinador`, `<project> - desarrollo`, `<project> -
 
 - Decision ladder before acting: does it need to exist? already in the codebase? stdlib or native feature? installed dependency? only then write new code. Read the code a change touches before editing it.
 - Return summaries of at most ~2k tokens with `path:line` evidence; never dump files into the coordinator.
-- Route mechanical, read-only work to a cheaper model; keep the strongest model for design and the single writer.
-- **Model per role and per kind of task** (defaults; log each session's context tokens per task and raise or lower a level from that data):
-
-  | Who | Kind of task | Model |
-  |---|---|---|
-  | Coordinator (technical direction) | decisions, reviewing deliveries, talking with the user | strongest (Opus) |
-  | Development | the single writer | strongest (Opus), medium effort |
-  | QA | gates: run suites and checks, compare against a spec | cheaper (Sonnet), medium effort |
-  | QA | research: decoding, reverse engineering, new measurements | strongest (Opus), medium effort |
-  | Subagents of any session | see the subagent rule below | Sonnet or Haiku |
-
-  The coordinator stays on the strongest model even when it is idle most of the time: its turns are few, and one wrong judgment there spreads to every session. Save on it by clearing it with a hand-over note, not by lowering its model. When QA's next task switches between gate and research, apply the escalation rule below (fresh or cleared session on the new model, not a switch on a long history).
+- **Model policy: the mid-tier model (Sonnet) by default, the strongest (Opus) only on demand.** Running several strongest-model sessions at once, each re-reading a long history every turn, is what burns a plan's limits.
+  - Every session and subagent runs on Sonnet (medium effort), coordinator included. Haiku for purely mechanical lookups and summaries.
+  - Always pass the model explicitly when starting a session or subagent; never let it inherit the coordinator's model.
+  - Opus (medium effort) only when a concrete task needs it: hard decoding of unfamiliar machine code, designing a new complex system, or a technical decision with large consequences. Use it as a **short-lived subagent with a compact brief and a compact return**, not as a long-lived session that accumulates context.
+  - At most one Opus run at a time; log the reason in the feature document.
+  - A long-lived session already on Opus moves to Sonnet at its next hand-over (clear + model change), not mid-task.
+  - When QA's next task switches between gate and research, apply the escalation rule below.
+- **Keep contexts small**: hand over at about 40 % context; restarting from a hand-over note is cheap, re-reading hundreds of thousands of tokens every turn is not. Batch instructions to a session into one message instead of waking it several times.
+- **Measure before rewriting**: when a reference implementation can be run (an emulator, a legacy binary, a production system), build the trace recorder and comparator first and freeze new behaviour work until it exists; then fix in a closed loop (run the comparison, read the diff, patch, re-run). Deterministic tools (headless disassembler / decompiler queries, memory dumps, diff scripts) do the extraction and hand the model a compact JSON, never raw decompiled code dumps.
+- **Group work by subsystem**: coupled mechanics (for example collision, guard push and juggle limits) go through one research -> development -> QA cycle together, not one cycle per item.
 - **Subagents inside a session** (Agent tool with a model override): use one only when the task produces a lot of output or repeats, so the parent reads a short result instead of the raw output. A check that takes 1-3 calls stays inline, because a subagent starts cold and pays to read. Sonnet: full merge checks (collisions, `--check`, tests, suites, restore generated files). Haiku: condense a long report or log section. Merge, product and acceptance decisions stay with the parent, from the subagent's numbers.
 - **A subagent's summary must be useful**: every brief demands this return shape, in at most ~15 lines:
   1. verdict first (PASS / FAIL / partial / answer);
@@ -286,8 +284,8 @@ Session names: `<project> - coordinador`, `<project> - desarrollo`, `<project> -
   - The coordinator clears that idle session (the app's clear-session tool, the same as `/clear`) and sends a restart brief: read the skill, the hand-over note and the feature document, then continue. Clearing works without a user turn; starting a new session may need one, so prefer clearing.
   - If clearing is not available, the session keeps working and lets auto-compact run; the coordinator replaces it on the user's next message without asking.
   - Only real product decisions and new live measurements go to the user, never session housekeeping.
-  - Do not wait for 75 % when a session's next task is blocked or it already passed ~55 %: ask for the hand-over at the next clean point; a cleared idle session costs nothing.
-- **Research and gates in parallel**: when QA has a gate queue and research work (decoding, live measurements) at the same time, the coordinator starts a 4th research session on the strongest model for the research items instead of switching QA's model; QA stays on gates.
+  - Do not wait for 75 % when a session's next task is blocked or it already passed ~40 %: ask for the hand-over at the next clean point; a cleared idle session costs nothing.
+- **Research and gates in parallel**: when QA has a gate queue and research work (decoding, live measurements) at the same time, the coordinator starts a 4th research session (Sonnet, with Opus subagent bursts for the hard decoding per the model policy) for the research items instead of switching QA's model; QA stays on gates.
 - **Commands handed to the user** must run as-is in the user's shell: on Windows PowerShell a quoted program path needs the call operator (`& "C:/path/app.exe" --flag`). When the user wants something launched, prefer launching it yourself in a terminal tab.
 - **User feedback from playing or using the product** goes into the feature document's Log verbatim, as a backlog task with an owner, even when the user says "tenlo como nota".
 - **Research before shortcuts**: when development is blocked by a missing decode, measurement or spec fact, the coordinator sends it to research first and pauses that task; development works on other items meanwhile. Do not implement around the gap with partial data. A shortcut is allowed only when the fact cannot be obtained at reasonable cost, and the coordinator says so in the Log.
