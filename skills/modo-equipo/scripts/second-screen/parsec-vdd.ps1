@@ -504,6 +504,16 @@ function New-EnsureResult([string]$id, [string]$keeper, $screen, [bool]$shared) 
     [pscustomobject]@{ ok = $true; secondScreen = $true; keeper = $keeper; id = $id; screen = $i.name; x = $i.x; y = $i.y; width = $i.width; height = $i.height; shared = $shared }
 }
 
+# The driver's device exists but its interface is gone: the driver host crashed (Windows event
+# 10111 "offline due to a user-mode driver crash") and stays down until the device is restarted.
+# Told apart from "not installed" so nobody reinstalls or starts other tools for nothing.
+function Test-DriverOffline {
+    try {
+        $d = @(Get-PnpDevice -Class Display -ErrorAction Stop | Where-Object { $_.InstanceId -like 'ROOT\DISPLAY\*' -and $_.FriendlyName -like '*Parsec*' })
+        return ($d.Count -gt 0)
+    } catch { return $false }
+}
+
 function Invoke-Ensure([string]$id, [int[]]$holders, [int]$idleMinutes, [int]$timeoutSeconds) {
     $screens = Get-ScreenList
     $second = @($screens | Where-Object { -not $_.Primary })
@@ -515,6 +525,10 @@ function Invoke-Ensure([string]$id, [int[]]$holders, [int]$idleMinutes, [int]$ti
     }
     if (-not $running -and -not [ModoEquipo.ParsecVdd]::FindDevicePath()) {
         if ($second.Count) { return New-EnsureResult $id 'no-driver' $second[0] $true }   # every session shares it
+        if (Test-DriverOffline) {
+            return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = 'none'; id = $id; driverOffline = $true
+                error = 'The Parsec Virtual Display Driver is installed but offline (its driver host crashed). Restart it: run "pnputil /restart-device ROOT\DISPLAY\0000" in an administrator terminal, or reboot. Nothing else to clean up.' }
+        }
         return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = 'none'; id = $id; error = 'Parsec Virtual Display Driver not installed (see references/second-screen.md, option B).' }
     }
     $request = Join-Path $script:SessionDir "$id.txt"
@@ -845,6 +859,7 @@ if ($SelfTest) {
     if ($path) {
         try { $v = $T::Open(); "INFO driver found, version $($v.Version())"; $v.Dispose() }
         catch { "INFO driver found but not openable: $($_.Exception.Message)" }
-    } else { 'INFO driver not installed' }
+    } elseif (Test-DriverOffline) { 'INFO driver installed but offline (crashed): restart the device or reboot' }
+    else { 'INFO driver not installed' }
     if ($fail) { "$fail check(s) failed"; exit 1 } else { 'All checks passed'; exit 0 }
 }

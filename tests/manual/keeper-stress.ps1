@@ -1,6 +1,6 @@
 param(
     [string]$Log = (Join-Path $env:TEMP 'modo-equipo-keeper-stress.log'),
-    [int]$Cycles = 50,
+    [int]$Cycles = 10,
     [ValidateRange(3, 7)][int]$Sessions = 4,
     [switch]$SkipLimit
 )
@@ -89,6 +89,10 @@ for ($i = 1; $i -le $Cycles; $i++) {
     do { Start-Sleep -Milliseconds 100; $gone = -not (@(Get-ScreenList | Where-Object { $_.Name -eq $new.Name }).Count) } while (-not $gone -and $sw.ElapsedMilliseconds -lt 10000)
     $times += $tAdd
     if (-not $gone) { $bad++; Note "cycle $i : $($new.Name) still there 10 s after remove" }
+    # A 50-cycle run once crashed the driver host (iddcx access violation, Windows event 10111):
+    # the device then stays offline until it is restarted. Stop at the first sign of that.
+    if (-not [ModoEquipo.ParsecVdd]::FindDevicePath()) { $bad++; Note "cycle $i : the driver went offline (crashed): stopping the cycles"; break }
+    Start-Sleep -Milliseconds 1000
     if ($i % 10 -eq 0) { Note "cycle $i : index=$idx screen=$($new.Name) at $($new.Bounds.X),$($new.Bounds.Y) add=${tAdd}ms removed=$gone" ; Guard 'driver cycles' }
 }
 $vdd.Dispose()

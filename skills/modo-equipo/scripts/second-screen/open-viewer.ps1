@@ -45,6 +45,8 @@ if (Test-Path $module) {
         Start-Sleep -Milliseconds 500; & $viewer @viewerArgs; exit 0
     }
     $directError = $r.error
+    # A crashed driver is not fixed by the ParsecVDisplay app (it hangs against it): say what to do.
+    if ($r.driverOffline -and -not (Test-Second)) { Fail $r.error }
   } catch {
     if ($Smoke) { throw }
     $directError = $_.Exception.Message
