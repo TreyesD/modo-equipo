@@ -7,6 +7,7 @@ param(
     [string]$ScreenId = '',
     [int[]]$HolderPid = @(),
     [int]$IdleMinutes = 10,
+    [int]$SpareMinutes = 720,
     [int]$TimeoutSeconds = 20
 )
 # Talks to the installed Parsec Virtual Display Driver directly, the same way the
@@ -599,7 +600,7 @@ function Wait-NewScreen([string[]]$before, [int]$ms) {
     return $null
 }
 
-function Invoke-Keeper([int]$idleMinutes) {
+function Invoke-Keeper([int]$idleMinutes, [int]$SpareMinutes = 720) {
     New-Item -ItemType Directory -Force -Path $script:SessionDir | Out-Null
     $log = Join-Path $script:KeeperDir 'keeper.log'
     function KLog($t) { try { Add-Content -Path $log -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $t" } catch {} }
@@ -701,7 +702,11 @@ function Invoke-Keeper([int]$idleMinutes) {
                     elseif (Test-KeeperIdle 0 $s.IdleSince $now $idleMinutes) { $why = "no holder for $idleMinutes min" }
                 }
                 if ($why) {
-                    if ($s.Ours) { Remove-Owned $s.Index }
+                    # Adding or removing a monitor makes Windows rebuild the display topology, which can
+                    # flash every screen. So a freed display is NOT removed: it stays as a spare that the
+                    # next session takes over, and is removed only after $SpareMinutes (12 h) unused, on
+                    # -Release, or when the keeper stops.
+                    if ($s.Ours) { $orphans = @($orphans) + @([pscustomobject]@{ index = $s.Index; device = $s.Device; id = ''; spareSince = (Get-Date -Format s) }) }
                     $sess.Remove($id)
                     foreach ($f in "$id.txt", "$id.release") { Remove-Item (Join-Path $script:SessionDir $f) -ErrorAction SilentlyContinue }
                     KLog "freed $($s.Device) of '$id' ($why)"
@@ -715,10 +720,15 @@ function Invoke-Keeper([int]$idleMinutes) {
             }
             Get-ChildItem -Path $script:SessionDir -Filter '*.release' -ErrorAction SilentlyContinue |
                 Where-Object { -not $sess[$_.BaseName.ToLowerInvariant()] } | Remove-Item -ErrorAction SilentlyContinue
-            # Displays left by a previous keeper that nobody claimed are removed.
-            if ($orphans.Count -and $clock.ElapsedMilliseconds -ge 15000) {
-                foreach ($o in $orphans) { Remove-Owned ([int]$o.index); KLog "removed unclaimed display $($o.device)#$($o.index)" }
-                $orphans = @(); Save-Owned
+            # Displays left by a previous keeper that nobody claimed are removed; spares kept after a
+            # release are removed only when they have been unused for $SpareMinutes.
+            if ($orphans.Count) {
+                $drop = @($orphans | Where-Object {
+                    if ($_.spareSince) { ((Get-Date) - [datetime]$_.spareSince).TotalMinutes -ge $SpareMinutes }
+                    else { $clock.ElapsedMilliseconds -ge 15000 }
+                })
+                foreach ($o in $drop) { Remove-Owned ([int]$o.index); KLog "removed unused display $($o.device)#$($o.index)" }
+                if ($drop.Count) { $orphans = @($orphans | Where-Object { $drop -notcontains $_ }); Save-Owned }
             }
 
             # 3. Mouse lock area: the real screens, whatever the number of virtual ones.
@@ -770,7 +780,7 @@ if ($Release) {
     Invoke-Release $rid | ConvertTo-Json -Compress; exit 0
 }
 if ($Status) { Get-KeeperStatus | ConvertTo-Json -Depth 5 -Compress; exit 0 }
-if ($Keep) { Invoke-Keeper $IdleMinutes; exit 0 }
+if ($Keep) { Invoke-Keeper $IdleMinutes $SpareMinutes; exit 0 }
 
 if ($SelfTest) {
     $fail = 0

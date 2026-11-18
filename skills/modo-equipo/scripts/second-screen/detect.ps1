@@ -1,16 +1,17 @@
-param([switch]$NoEnsure, [string]$ScreenId = '')
+param([switch]$Ensure, [switch]$NoEnsure, [string]$ScreenId = '')
 # Prints one JSON object describing whether a second screen is available.
-# It first asks the screen keeper (parsec-vdd.ps1 -Ensure) for this session's own screen (the id
-# is -ScreenId, else MODO_EQUIPO_SCREEN_ID, else 'default'); "screen" names it. That screen stays
-# for the keeper's idle time (launchers then register their programs as holders). -NoEnsure only
-# looks, and "screen" is then the first second screen.
+# By default it only LOOKS: it never adds a monitor (adding or removing one makes Windows rebuild
+# the display topology, which can flash every screen), and "screen" is the first second screen.
+# -Ensure [-ScreenId <id>] first asks the screen keeper (parsec-vdd.ps1 -Ensure) for this
+# session's own screen (-ScreenId, else MODO_EQUIPO_SCREEN_ID, else the Claude Code session, else
+# 'default'); "screen" then names it. -NoEnsure is accepted and means the default.
 # Windows PowerShell 5.1+ only. Exit code is always 0; read the JSON.
 $ErrorActionPreference = 'Stop'
 try {
     Add-Type -AssemblyName System.Windows.Forms
     $keeperResult = $null
     $keeper = Join-Path $PSScriptRoot 'parsec-vdd.ps1'
-    if (-not $NoEnsure -and $env:MODO_EQUIPO_NO_SECOND_SCREEN -ne '1' -and (Test-Path $keeper)) {
+    if ($Ensure -and -not $NoEnsure -and $env:MODO_EQUIPO_NO_SECOND_SCREEN -ne '1' -and (Test-Path $keeper)) {
         $ensureArgs = @('-Ensure'); if ($ScreenId) { $ensureArgs += @('-ScreenId', $ScreenId) }
         try { $keeperResult = ("$(& $keeper @ensureArgs)" | ConvertFrom-Json) } catch {}
         [Windows.Forms.Screen].GetField('screens', [Reflection.BindingFlags]'NonPublic,Static').SetValue($null, $null)

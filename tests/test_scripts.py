@@ -453,8 +453,8 @@ class LaunchOffscreenLive(unittest.TestCase):
         primary = next(s for s in m.list_screens() if s["primary"])["rect"]
         saved = self.notepad_settings()
         self.addCleanup(self.restore_notepad_settings, saved)
-        out = run(os.path.join("second-screen", "launch_offscreen.py"), "--timeout", "10", "--keep-watch", "3",
-                  "--trace", "--", "notepad.exe")
+        out = run(os.path.join("second-screen", "launch_offscreen.py"), "--no-ensure", "--timeout", "10", "--keep-watch", "3",
+                  "--trace", "--", "notepad.exe")   # --no-ensure: a test must never add a monitor (it can flash every screen)
         result = json.loads(out.stdout)
         pids = set(result.get("pids", []))
         self.addCleanup(self.close_windows, m, pids)
