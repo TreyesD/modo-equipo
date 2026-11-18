@@ -366,6 +366,29 @@ class LaunchOffscreen(unittest.TestCase):
         self.assertIsNone(self.m.ensure_screen(run=broken, environ={}, exists=lambda p: True))
         self.assertTrue(self.m.parse_args(["--no-ensure", "--", "app"]).no_ensure)
 
+    def test_launchers_pass_keeper_arguments_by_name(self):
+        # Reopen bug: splatting an ARRAY ('-Ensure', '-HolderPid', $PID) into a script binds the
+        # strings by position, so "-HolderPid" became a value of the Int32[] parameter.
+        sd = os.path.join(SCRIPTS, "second-screen")
+        for name in ("open-viewer.ps1", "launch-on-second-screen.ps1", "detect.ps1"):
+            text = open(os.path.join(sd, name), encoding="utf-8").read()
+            self.assertNotIn("@('-Ensure'", text, name)
+            self.assertIn("@{ Ensure = $true", text, name)
+        viewer = open(os.path.join(sd, "open-viewer.ps1"), encoding="utf-8").read()
+        self.assertNotIn("Start-Process $pvd", viewer)   # the ParsecVDisplay app is never started
+        if os.name != "nt":
+            self.skipTest("PowerShell binding check needs Windows")
+        with tempfile.TemporaryDirectory() as d:
+            tool = os.path.join(d, "k.ps1")
+            with open(tool, "w", encoding="utf-8") as f:
+                f.write("param([switch]$Ensure, [int[]]$HolderPid, [string]$ScreenId)\n"
+                        "'{0}|{1}|{2}' -f $Ensure.IsPresent, ($HolderPid -join ','), $ScreenId\n")
+            def call(expr):
+                return subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", expr],
+                                      capture_output=True, text=True, timeout=60).stdout.strip()
+            self.assertEqual(call("$a = @{ Ensure = $true; HolderPid = @($PID); ScreenId = 'x' }; $o = & '%s' @a; $o -replace '[|][0-9]+[|]', '|N|'" % tool), "True|N|x")
+            self.assertEqual(call("$a = @('-Ensure','-HolderPid',$PID); try { & '%s' @a } catch { 'BIND ERROR' }" % tool), "BIND ERROR")
+
     def test_session_screen_id(self):
         cmd = self.m.keeper_command(holder=42, script="k.ps1", screen_id="qa")
         self.assertEqual(cmd[-7:], ["-File", "k.ps1", "-Ensure", "-ScreenId", "qa", "-HolderPid", "42"])
@@ -492,13 +515,13 @@ class ParsecVirtualDisplay(unittest.TestCase):
             launcher = f.read()
         self.assertIn("parsec-vdd.ps1", install)   # the shortcut copy must include the module
         self.assertIn("parsec-vdd.ps1", launcher)
-        self.assertIn("'-Ensure', '-HolderPid', $PID", launcher)   # the viewer holds its session's screen
+        self.assertIn("Ensure = $true; HolderPid = @($PID)", launcher)   # the viewer holds its session's screen
         self.assertIn("$viewerArgs['Screen'] = $r.screen", launcher)  # and shows that screen
         for name in ("launch-on-second-screen.ps1", "detect.ps1"):
             with open(os.path.join(self.DIR, name), encoding="utf-8") as f:
                 text = f.read()
-            self.assertIn("'-Ensure'", text, name)     # launchers ask the keeper for a screen
-            self.assertIn("'-ScreenId'", text, name)   # for their own session id
+            self.assertIn("Ensure = $true", text, name)     # launchers ask the keeper for a screen
+            self.assertIn("['ScreenId'] = $ScreenId", text, name)   # for their own session id
 
     @unittest.skipUnless(sys.platform == "win32", "Windows PowerShell only")
     def test_self_test_checks_ioctls_without_adding_a_display(self):

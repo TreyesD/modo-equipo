@@ -12,7 +12,7 @@ try {
     $keeperResult = $null
     $keeper = Join-Path $PSScriptRoot 'parsec-vdd.ps1'
     if ($Ensure -and -not $NoEnsure -and $env:MODO_EQUIPO_NO_SECOND_SCREEN -ne '1' -and (Test-Path $keeper)) {
-        $ensureArgs = @('-Ensure'); if ($ScreenId) { $ensureArgs += @('-ScreenId', $ScreenId) }
+        $ensureArgs = @{ Ensure = $true }; if ($ScreenId) { $ensureArgs['ScreenId'] = $ScreenId }   # a hashtable: an array would bind positionally
         try { $keeperResult = ("$(& $keeper @ensureArgs)" | ConvertFrom-Json) } catch {}
         [Windows.Forms.Screen].GetField('screens', [Reflection.BindingFlags]'NonPublic,Static').SetValue($null, $null)
     }

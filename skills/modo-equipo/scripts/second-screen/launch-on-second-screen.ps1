@@ -25,8 +25,8 @@ function Get-Screen([string]$name) {
     else { $all | Where-Object { -not $_.Primary } | Select-Object -First 1 }
 }
 $second = $null
-$ensureArgs = @('-Ensure', '-HolderPid', $PID)
-if ($ScreenId) { $ensureArgs += @('-ScreenId', $ScreenId) }
+$ensureArgs = @{ Ensure = $true; HolderPid = @($PID) }   # a hashtable: an array would bind positionally
+if ($ScreenId) { $ensureArgs['ScreenId'] = $ScreenId }
 if ($env:MODO_EQUIPO_NO_SECOND_SCREEN -eq '1') { $second = $null }  # test switch
 elseif (Test-Path $keeper) {
     $json = & $keeper @ensureArgs
@@ -44,6 +44,6 @@ $deadline = (Get-Date).AddSeconds(10)
 while ($p.MainWindowHandle -eq 0 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200; $p.Refresh() }
 $b = $second.Bounds
 [SsWin]::MoveWindow($p.MainWindowHandle, $b.X + 40, $b.Y + 40, $b.Width - 80, $b.Height - 120, $true) | Out-Null
-if (Test-Path $keeper) { $ensureArgs[2] = $p.Id; $null = & $keeper @ensureArgs }   # keep the screen while the runner lives
+if (Test-Path $keeper) { $ensureArgs['HolderPid'] = @($p.Id); $null = & $keeper @ensureArgs }   # keep the screen while the runner lives
 Write-Output "LAUNCHED pid=$($p.Id) screen=$($second.DeviceName)"
 exit 0
