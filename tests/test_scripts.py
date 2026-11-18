@@ -366,6 +366,28 @@ class LaunchOffscreen(unittest.TestCase):
         self.assertIsNone(self.m.ensure_screen(run=broken, environ={}, exists=lambda p: True))
         self.assertTrue(self.m.parse_args(["--no-ensure", "--", "app"]).no_ensure)
 
+    def test_session_screen_id(self):
+        cmd = self.m.keeper_command(holder=42, script="k.ps1", screen_id="qa")
+        self.assertEqual(cmd[-7:], ["-File", "k.ps1", "-Ensure", "-ScreenId", "qa", "-HolderPid", "42"])
+        self.assertNotIn("-ScreenId", self.m.keeper_command(script="k.ps1"))   # keeper reads the env var
+        calls = []
+
+        class Out:
+            stdout = '{"ok": true, "secondScreen": true, "keeper": "running", "id": "qa", "screen": "DISPLAY7"}\n'
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return Out()
+        answer = self.m.ensure_screen(run=fake_run, environ={}, exists=lambda p: True, screen_id="qa")
+        self.assertEqual(answer["screen"], "DISPLAY7")
+        self.assertIn("qa", calls[0])
+        self.assertEqual(self.m.parse_args(["--screen-id", "qa", "--", "app"]).screen_id, "qa")
+        self.assertIsNone(self.m.parse_args(["--", "app"]).screen_id)
+        screens = [{"name": "DISPLAY1", "primary": True}, {"name": "DISPLAY7", "primary": False}]
+        self.assertIs(self.m.screen_by_name(screens, "display7"), screens[1])
+        self.assertIsNone(self.m.screen_by_name(screens, "DISPLAY9"))
+        self.assertIsNone(self.m.screen_by_name(screens, None))
+
     def test_screen_choice(self):
         screens = [{"primary": True}, {"primary": False, "id": "a"}, {"primary": False, "id": "b"}]
         self.assertEqual(self.m.choose_screen(screens, "auto")["id"], "a")
@@ -470,10 +492,13 @@ class ParsecVirtualDisplay(unittest.TestCase):
             launcher = f.read()
         self.assertIn("parsec-vdd.ps1", install)   # the shortcut copy must include the module
         self.assertIn("parsec-vdd.ps1", launcher)
-        self.assertIn("-Ensure -HolderPid $PID", launcher)   # the viewer holds the keeper's screen
+        self.assertIn("'-Ensure', '-HolderPid', $PID", launcher)   # the viewer holds its session's screen
+        self.assertIn("$viewerArgs['Screen'] = $r.screen", launcher)  # and shows that screen
         for name in ("launch-on-second-screen.ps1", "detect.ps1"):
             with open(os.path.join(self.DIR, name), encoding="utf-8") as f:
-                self.assertIn("-Ensure", f.read(), name)   # launchers ask the keeper for a screen
+                text = f.read()
+            self.assertIn("'-Ensure'", text, name)     # launchers ask the keeper for a screen
+            self.assertIn("'-ScreenId'", text, name)   # for their own session id
 
     @unittest.skipUnless(sys.platform == "win32", "Windows PowerShell only")
     def test_self_test_checks_ioctls_without_adding_a_display(self):

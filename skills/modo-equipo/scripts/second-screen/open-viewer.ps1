@@ -5,9 +5,14 @@
 # viewer is open and for the keeper's idle time after it closes (tests may still need it); the
 # keeper also keeps the mouse on the main screen. Only if the driver cannot be used does it fall
 # back to starting the ParsecVDisplay app and pressing ADD DISPLAY.
+# The screen belongs to a keeper session: -ScreenId <id>, else MODO_EQUIPO_SCREEN_ID, else the
+# Claude Code session it was started from. Started from the desktop shortcut (no id at all) every
+# launch gets a NEW virtual screen of its own (session "viewer-<pid>"), so tests that team
+# sessions run on their own screens never land on the screen you are using. -NewScreen forces
+# that. With several second screens the toolbar switches between them.
 # -Smoke (developer check): runs the same -Ensure, opens the viewer in its -Smoke mode for a few
 # seconds and prints the -Ensure result.
-param([switch]$Smoke)
+param([switch]$Smoke, [string]$ScreenId = '', [switch]$NewScreen)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, UIAutomationClient, UIAutomationTypes
 
@@ -27,10 +32,18 @@ $directError = $null
 $module = Join-Path $PSScriptRoot 'parsec-vdd.ps1'
 if (Test-Path $module) {
   try {
-    $json = & $module -Ensure -HolderPid $PID
+    $ensureArgs = @('-Ensure', '-HolderPid', $PID)
+    if ($NewScreen) { $ScreenId = "viewer-$PID" }
+    elseif (-not $ScreenId -and -not $env:MODO_EQUIPO_SCREEN_ID -and -not $env:CLAUDE_CODE_SESSION_ID) { $ScreenId = "viewer-$PID" }   # desktop shortcut
+    if ($ScreenId) { $ensureArgs += @('-ScreenId', $ScreenId) }
+    $json = & $module @ensureArgs
     $r = "$json" | ConvertFrom-Json
     if ($Smoke) { "smoke: ensure $json" }
-    if ($r.ok) { Start-Sleep -Milliseconds 500; & $viewer @viewerArgs; exit 0 }
+    if ($r.ok) {
+        $viewerArgs['Screen'] = $r.screen
+        if ($r.id -and -not $r.shared) { $viewerArgs['ScreenId'] = $r.id }
+        Start-Sleep -Milliseconds 500; & $viewer @viewerArgs; exit 0
+    }
     $directError = $r.error
   } catch {
     if ($Smoke) { throw }

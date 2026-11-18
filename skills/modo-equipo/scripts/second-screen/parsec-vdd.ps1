@@ -4,6 +4,7 @@ param(
     [switch]$Release,
     [switch]$Status,
     [switch]$Keep,
+    [string]$ScreenId = '',
     [int[]]$HolderPid = @(),
     [int]$IdleMinutes = 10,
     [int]$TimeoutSeconds = 20
@@ -160,9 +161,20 @@ public sealed class ParsecVdd : IDisposable {
     public bool Ping() { return Io(IoctlUpdate, null) != -1; }
 
     // Adds one virtual display and starts the keep-alive thread. Returns the display index.
+    // Right after a display was removed the driver sometimes refuses the next ADD (measured: about
+    // one in four quick add/remove cycles); a later try works, so it retries for up to ~6 s.
+    public int LastAddAttempts;
+    static readonly int[] AddRetryMs = { 250, 500, 1000, 1500, 2500 };
     public int AddDisplay() {
         int index = Io(IoctlAdd, null);
-        if (index < 0) throw new InvalidOperationException("The driver refused to add a display.");
+        LastAddAttempts = 1;
+        for (int i = 0; index < 0 && i < AddRetryMs.Length; i++) {
+            Ping();
+            Thread.Sleep(AddRetryMs[i]);
+            index = Io(IoctlAdd, null);
+            LastAddAttempts++;
+        }
+        if (index < 0) throw new InvalidOperationException("The driver refused to add a display (" + LastAddAttempts + " tries).");
         Ping();
         lock (added) added.Add(index);
         StartPinger();
@@ -203,22 +215,32 @@ public sealed class ParsecVdd : IDisposable {
 }
 
 # ==========================================================================================
-# Screen keeper: one hidden background process that keeps a virtual second screen for as long
-# as something needs it (the viewer, a test runner, an app placed there), and keeps the mouse on
-# the real screens while a virtual screen exists.
+# Screen keeper: one hidden background process that gives every test-screen session its own
+# virtual monitor for as long as that session needs it (the viewer, a test runner, an app placed
+# there), and keeps the mouse on the real screens while any virtual screen exists.
 #
-#   parsec-vdd.ps1 -Ensure [-HolderPid <pid>,...] [-IdleMinutes N]
-#       Makes sure a second screen exists: starts the keeper (or reuses the running one), waits
-#       for Windows to report the screen and prints one JSON line. Holder pids keep the screen
-#       alive while those processes run; after the last holder ends (or when none was given)
-#       the keeper waits IdleMinutes (default 10) and then removes the screen and exits.
-#       Exit 0 = a second screen is available, 1 = it could not be provided.
-#   parsec-vdd.ps1 -Release   stops the keeper now (removes its screen, frees the mouse).
-#   parsec-vdd.ps1 -Status    prints the keeper state as JSON.
-#   parsec-vdd.ps1 -Keep      the keeper itself (started hidden by -Ensure; not for direct use).
+#   parsec-vdd.ps1 -Ensure [-ScreenId <id>] [-HolderPid <pid>,...] [-IdleMinutes N]
+#       Makes sure session <id> has its own screen: starts the keeper (or reuses the running one),
+#       which adds a virtual display for a new id and hands the same one back to a known id. It
+#       waits for Windows to report the screen and prints one JSON line with its device name and
+#       bounds. The id is -ScreenId, else the MODO_EQUIPO_SCREEN_ID environment variable, else
+#       'default' ('default' first takes a second screen that already exists, such as a real
+#       monitor). Holder pids keep the screen while those processes run; after the last holder
+#       ends (or when none was given) the session lasts IdleMinutes (default 10) more, then its
+#       display is removed. The keeper exits when no session is left. Up to 8 virtual displays
+#       (VDD_MAX_DISPLAYS in parsec-vdd.h). Exit 0 = the session has a screen, 1 = it could not
+#       be provided.
+#   parsec-vdd.ps1 -Release -ScreenId <id>   frees that session's screen now.
+#   parsec-vdd.ps1 -Release                  stops the keeper (removes all its screens).
+#   parsec-vdd.ps1 -Status                   prints the keeper state (sessions, screens) as JSON.
+#   parsec-vdd.ps1 -Keep                     the keeper itself (started hidden by -Ensure).
+#
+# A keeper that dies leaves its sessions' request files and owned.json behind; while another
+# program keeps the displays alive (the ParsecVDisplay app pings every display), the next keeper
+# gives each id its old display back and removes the unclaimed ones after 15 s.
 #
 # Mouse lock: while a virtual screen exists the keeper confines the cursor (ClipCursor) to the
-# real screens, so plain movement does not drift onto the virtual one. It lifts the clip while a
+# real screens, so plain movement does not drift onto the virtual ones. It lifts the clip while a
 # mouse button is held (dragging a window across) and while the viewer owns the named mutex
 # Local\ModoEquipo.CursorFree (its direct mode). It never replaces a clip another program set.
 # The flag file <state>\lock-off turns the lock off (the viewer's lock button writes it).
@@ -342,9 +364,17 @@ public sealed class CursorLock {
 '@
 }
 
-$script:KeeperDir = Join-Path $env:USERPROFILE '.claude\modo-equipo\screen-keeper'
-$script:KeeperMutexName = 'Local\ModoEquipo.ScreenKeeper'
-$script:KeeperStopName = 'Local\ModoEquipo.ScreenKeeper.Stop'
+# This keeper (per-session screens) has its own state folder and kernel names ("-v2"), so it can
+# run next to an older one-screen keeper that is still alive: the old one keeps the screen it
+# holds for whoever uses it and is never shared with new sessions. MODO_EQUIPO_KEEPER_TAG adds
+# one more separate keeper (for tests), so a development copy can run next to the real one.
+$script:KeeperTag = '-v2' + $(if ($env:MODO_EQUIPO_KEEPER_TAG -match '^[A-Za-z0-9_-]{1,20}$') { "-$($env:MODO_EQUIPO_KEEPER_TAG)" } else { '' })
+$script:KeeperDir = Join-Path $env:USERPROFILE ".claude\modo-equipo\screen-keeper$script:KeeperTag"
+$script:SessionDir = Join-Path $script:KeeperDir 'sessions'
+$script:KeeperMutexName = "Local\ModoEquipo.ScreenKeeper$script:KeeperTag"
+$script:KeeperStopName = "Local\ModoEquipo.ScreenKeeper$script:KeeperTag.Stop"
+$script:MaxDisplays = 8   # VDD_MAX_DISPLAYS in parsec-vdd.h (the adapter takes 16; half avoids plugging lag)
+$script:KeeperVersion = 2
 
 # Area the cursor is kept in while a virtual screen exists: the bounding box of the screens that
 # are not virtual. $null (no lock) when there is no virtual screen, or when that box would also
@@ -368,10 +398,43 @@ function Get-HomeRect($screens) {
 function Get-LiveHolders([int[]]$pids, [scriptblock]$IsAlive) {
     @($pids | Where-Object { $_ -gt 0 } | Select-Object -Unique | Where-Object { & $IsAlive $_ })
 }
+$script:IsAlive = { param($p) [bool](Get-Process -Id $p -ErrorAction SilentlyContinue) }
 
-# The keeper stops after IdleMinutes with no live holder.
+# A session (and the keeper's legacy single screen) ends after IdleMinutes with no live holder.
 function Test-KeeperIdle([int]$liveCount, [double]$idleSinceMs, [double]$nowMs, [double]$idleMinutes) {
     return ($liveCount -eq 0 -and ($nowMs - $idleSinceMs) -ge $idleMinutes * 60000)
+}
+
+# Screen id of the caller: -ScreenId, else MODO_EQUIPO_SCREEN_ID, else the Claude Code session
+# it runs in ("cc-" + the first 8 characters of CLAUDE_CODE_SESSION_ID, so every Claude session
+# gets its own screen with no setup), else 'default'.
+function Resolve-ScreenId([string]$id) {
+    if (-not $id) { $id = $env:MODO_EQUIPO_SCREEN_ID }
+    if (-not $id -and $env:CLAUDE_CODE_SESSION_ID -match '^[A-Za-z0-9-]{8,}$') { $id = 'cc-' + $env:CLAUDE_CODE_SESSION_ID.Substring(0, 8) }
+    if (-not $id) { $id = 'default' }
+    if ($id -notmatch '^[A-Za-z0-9._-]{1,40}$') { throw "Invalid screen id '$id' (letters, digits, '.', '_' or '-', up to 40)." }
+    return $id.ToLowerInvariant()
+}
+
+# Which screen a new session gets. $screens: Name/Primary/Virtual; $assigned: device names other
+# sessions hold; $orphans: displays this keeper owns with no session (index, device, id).
+#   1. its own display, left from before a keeper restart
+#   2. 'default' only: a second screen that is already there (a real monitor, or a virtual one
+#      another program added); it is shared with nobody and never removed by the keeper
+#   3. any other display the keeper owns and nobody uses
+#   4. a new display
+function Select-ScreenFor([string]$id, $screens, [string[]]$assigned, $orphans) {
+    $present = @($screens | ForEach-Object { $_.Name })
+    $free = @($orphans | Where-Object { $present -contains $_.device -and $assigned -notcontains $_.device })
+    $own = @($free | Where-Object { $_.id -eq $id })
+    if ($own.Count) { return [pscustomobject]@{ Kind = 'orphan'; Device = $own[0].device; Index = [int]$own[0].index } }
+    if ($id -eq 'default') {
+        $orphanNames = @($orphans | ForEach-Object { $_.device })
+        $there = @($screens | Where-Object { -not $_.Primary -and $assigned -notcontains $_.Name -and $orphanNames -notcontains $_.Name })
+        if ($there.Count) { return [pscustomobject]@{ Kind = 'adopt'; Device = $there[0].Name; Index = -1 } }
+    }
+    if ($free.Count) { return [pscustomobject]@{ Kind = 'orphan'; Device = $free[0].device; Index = [int]$free[0].index } }
+    return [pscustomobject]@{ Kind = 'add'; Device = $null; Index = -1 }
 }
 
 # Fresh screen list (WinForms caches it; a process without a message loop never sees changes).
@@ -388,77 +451,117 @@ function Test-KeeperRunning {
     try { return [Threading.Mutex]::TryOpenExisting($script:KeeperMutexName, [ref]$m) } finally { if ($m) { $m.Dispose() } }
 }
 
-function Add-KeeperHolders([int[]]$pids) {
-    if (-not $pids) { return }
-    New-Item -ItemType Directory -Force -Path $script:KeeperDir | Out-Null
-    $file = Join-Path $script:KeeperDir 'holders.txt'
+# Pid files: one pid per line. Appends retry briefly because the keeper rewrites the file.
+function Add-PidFile([string]$file, [int[]]$pids) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $file) | Out-Null
+    $text = (($pids | Where-Object { $_ -gt 0 } | ForEach-Object { "$_`r`n" }) -join '')
     for ($i = 0; $i -lt 20; $i++) {
-        try { [IO.File]::AppendAllText($file, (($pids | ForEach-Object { "$_" }) -join "`r`n") + "`r`n"); return } catch { Start-Sleep -Milliseconds 50 }
+        try { [IO.File]::AppendAllText($file, $text); return } catch { Start-Sleep -Milliseconds 50 }
     }
 }
-
-function Read-KeeperHolders {
-    $file = Join-Path $script:KeeperDir 'holders.txt'
+function Read-PidFile([string]$file) {
     if (-not (Test-Path $file)) { return @() }
     try { @([IO.File]::ReadAllLines($file) | ForEach-Object { $n = 0; if ([int]::TryParse($_.Trim(), [ref]$n)) { $n } }) } catch { @() }
 }
+function Write-PidFile([string]$file, [int[]]$pids) {
+    try { [IO.File]::WriteAllText($file, (($pids | ForEach-Object { "$_`r`n" }) -join '')) } catch {}
+}
 
-function Write-KeeperHolders([int[]]$pids) {
-    $file = Join-Path $script:KeeperDir 'holders.txt'
-    try { [IO.File]::WriteAllText($file, (($pids | ForEach-Object { "$_" }) -join "`r`n") + $(if ($pids) { "`r`n" } else { '' })) } catch {}
+function Read-KeeperState {
+    $sf = Join-Path $script:KeeperDir 'keeper.json'
+    if (-not (Test-Path $sf)) { return $null }
+    for ($i = 0; $i -lt 5; $i++) {
+        try { return (Get-Content $sf -Raw -ErrorAction Stop | ConvertFrom-Json) } catch { Start-Sleep -Milliseconds 40 }
+    }
+    return $null
+}
+
+function ConvertTo-ScreenInfo($s) {
+    if (-not $s) { return $null }
+    [pscustomobject]@{ name = $s.Name; primary = $s.Primary; virtual = $s.Virtual; x = $s.Bounds.X; y = $s.Bounds.Y; width = $s.Bounds.Width; height = $s.Bounds.Height }
 }
 
 function Get-KeeperStatus {
-    $state = $null
     $running = [bool](Test-KeeperRunning)
-    $sf = Join-Path $script:KeeperDir 'keeper.json'
-    if ($running -and (Test-Path $sf)) { try { $state = Get-Content $sf -Raw | ConvertFrom-Json } catch {} }
+    $state = if ($running) { Read-KeeperState } else { $null }
     $screens = Get-ScreenList
     [pscustomobject]@{
         keeper       = $running
+        version      = $(if ($state -and $state.version) { $state.version } elseif ($state) { 1 } else { $null })
         pid          = $(if ($state) { $state.pid } else { $null })
-        addedScreen  = $(if ($state) { $state.added } else { $false })
+        sessions     = @($(if ($state -and $state.sessions) { $state.sessions }))
+        errors       = @($(if ($state -and $state.errors) { $state.errors }))
         lockArea     = $(if ($state) { $state.lockArea } else { '' })
         lockOn       = -not (Test-Path (Join-Path $script:KeeperDir 'lock-off'))
-        holders      = @(Get-LiveHolders (Read-KeeperHolders) { param($p) [bool](Get-Process -Id $p -ErrorAction SilentlyContinue) })
         secondScreen = [bool]@($screens | Where-Object { -not $_.Primary }).Count
-        screens      = @($screens | ForEach-Object { [pscustomobject]@{ name = $_.Name; primary = $_.Primary; virtual = $_.Virtual; x = $_.Bounds.X; y = $_.Bounds.Y; width = $_.Bounds.Width; height = $_.Bounds.Height } })
+        screens      = @($screens | ForEach-Object { ConvertTo-ScreenInfo $_ })
     }
 }
 
-function Invoke-Ensure([int[]]$holders, [int]$idleMinutes, [int]$timeoutSeconds) {
-    Add-KeeperHolders $holders
+function New-EnsureResult([string]$id, [string]$keeper, $screen, [bool]$shared) {
+    $i = ConvertTo-ScreenInfo $screen
+    [pscustomobject]@{ ok = $true; secondScreen = $true; keeper = $keeper; id = $id; screen = $i.name; x = $i.x; y = $i.y; width = $i.width; height = $i.height; shared = $shared }
+}
+
+function Invoke-Ensure([string]$id, [int[]]$holders, [int]$idleMinutes, [int]$timeoutSeconds) {
     $screens = Get-ScreenList
     $second = @($screens | Where-Object { -not $_.Primary })
     $virtual = @($second | Where-Object { $_.Virtual })
     $running = Test-KeeperRunning
-    # A real second monitor and no virtual one: nothing to keep and nothing to lock.
-    if ($second.Count -gt 0 -and $virtual.Count -eq 0 -and -not $running) {
-        return [pscustomobject]@{ ok = $true; secondScreen = $true; keeper = 'not-needed'; screen = $second[0].Name }
+    # 'default' with a real second monitor and no virtual one: nothing to keep and nothing to lock.
+    if ($id -eq 'default' -and $second.Count -gt 0 -and $virtual.Count -eq 0 -and -not $running) {
+        return New-EnsureResult $id 'not-needed' $second[0] $false
     }
+    if (-not $running -and -not [ModoEquipo.ParsecVdd]::FindDevicePath()) {
+        if ($second.Count) { return New-EnsureResult $id 'no-driver' $second[0] $true }   # every session shares it
+        return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = 'none'; id = $id; error = 'Parsec Virtual Display Driver not installed (see references/second-screen.md, option B).' }
+    }
+    $request = Join-Path $script:SessionDir "$id.txt"
+    Remove-Item (Join-Path $script:SessionDir "$id.release") -ErrorAction SilentlyContinue
+    Add-PidFile $request $holders
     $how = 'running'
     if (-not $running) {
-        if ($second.Count -eq 0 -and -not [ModoEquipo.ParsecVdd]::FindDevicePath()) {
-            return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = 'none'; error = 'Parsec Virtual Display Driver not installed (see references/second-screen.md, option B).' }
-        }
         $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $argLine = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script:VddScript`" -Keep -IdleMinutes $idleMinutes"
         Start-Process -FilePath $ps -ArgumentList $argLine -WindowStyle Hidden | Out-Null
         $how = 'started'
     }
     $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    $since = Get-Date
     do {
-        $second = @(Get-ScreenList | Where-Object { -not $_.Primary })
-        if ($second.Count -gt 0) { return [pscustomobject]@{ ok = $true; secondScreen = $true; keeper = $how; screen = $second[0].Name } }
+        $state = Read-KeeperState
+        if ($state) {
+            $s = @($state.sessions | Where-Object { $_.id -eq $id })
+            if ($s.Count) {
+                $scr = @(Get-ScreenList | Where-Object { $_.Name -eq $s[0].device })
+                if ($scr.Count) { return New-EnsureResult $id $how $scr[0] $false }
+            }
+            $e = @($state.errors | Where-Object { $_.id -eq $id -and [datetime]$_.at -ge $since.AddSeconds(-2) })
+            if ($e.Count) { return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = $how; id = $id; error = $e[0].error } }
+        }
         Start-Sleep -Milliseconds 300
     } while ((Get-Date) -lt $deadline)
     $log = Join-Path $script:KeeperDir 'keeper.log'
     $last = if (Test-Path $log) { (Get-Content $log -Tail 1) } else { '' }
-    return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = $how; error = "no second screen after $timeoutSeconds s. $last" }
+    return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = $how; id = $id; error = "no screen for '$id' after $timeoutSeconds s. $last" }
 }
 
-function Invoke-Release {
-    if (-not (Test-KeeperRunning)) { return [pscustomobject]@{ ok = $true; keeper = 'none' } }
+# -Release -ScreenId <id> frees that session's screen; -Release alone stops the keeper.
+function Invoke-Release([string]$id) {
+    if (-not (Test-KeeperRunning)) { return [pscustomobject]@{ ok = $true; keeper = 'none'; id = $id } }
+    if ($id) {
+        New-Item -ItemType Directory -Force -Path $script:SessionDir | Out-Null
+        Set-Content -Path (Join-Path $script:SessionDir "$id.release") -Value '1'
+        $deadline = (Get-Date).AddSeconds(8)
+        do {
+            $state = Read-KeeperState
+            if ($state -and -not @($state.sessions | Where-Object { $_.id -eq $id }).Count -and -not (Test-Path (Join-Path $script:SessionDir "$id.txt"))) {
+                return [pscustomobject]@{ ok = $true; keeper = 'running'; id = $id; released = $true }
+            }
+            Start-Sleep -Milliseconds 200
+        } while ((Get-Date) -lt $deadline -and (Test-KeeperRunning))
+        return [pscustomobject]@{ ok = -not (Test-KeeperRunning) -or -not (Test-Path (Join-Path $script:SessionDir "$id.txt")); keeper = $(if (Test-KeeperRunning) { 'running' } else { 'stopped' }); id = $id; released = $true }
+    }
     $ev = $null
     try {
         if ([Threading.EventWaitHandle]::TryOpenExisting($script:KeeperStopName, [ref]$ev)) { [void]$ev.Set() }
@@ -485,58 +588,169 @@ if (Test-Path `$f) {
     Start-Process -FilePath (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $enc" -WindowStyle Hidden | Out-Null
 }
 
+# Waits for Windows to report a virtual screen that was not in $before.
+function Wait-NewScreen([string[]]$before, [int]$ms) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $new = @(Get-ScreenList | Where-Object { $_.Virtual -and -not $_.Primary -and $before -notcontains $_.Name })
+        if ($new.Count) { return $new[0] }
+        Start-Sleep -Milliseconds 200
+    } while ($sw.ElapsedMilliseconds -lt $ms)
+    return $null
+}
+
 function Invoke-Keeper([int]$idleMinutes) {
-    New-Item -ItemType Directory -Force -Path $script:KeeperDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $script:SessionDir | Out-Null
     $log = Join-Path $script:KeeperDir 'keeper.log'
     function KLog($t) { try { Add-Content -Path $log -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $t" } catch {} }
     $created = $false
     $single = New-Object Threading.Mutex($true, $script:KeeperMutexName, [ref]$created)
     if (-not $created) { $single.Dispose(); return }   # another keeper already runs
-    Set-Content -Path $log -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') keeper start pid=$PID idle=${idleMinutes}min"
+    Set-Content -Path $log -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') keeper start pid=$PID idle=${idleMinutes}min version=$script:KeeperVersion"
     [void][ModoEquipo.CursorLock]::SetProcessDpiAwarenessContext([IntPtr](-4))   # physical pixels
     $stop = New-Object Threading.EventWaitHandle($false, 'ManualReset', $script:KeeperStopName)
     $clipFile = Join-Path $script:KeeperDir 'clip.txt'
     $stateFile = Join-Path $script:KeeperDir 'keeper.json'
+    $ownedFile = Join-Path $script:KeeperDir 'owned.json'
     $offFile = Join-Path $script:KeeperDir 'lock-off'
     $lock = New-Object ModoEquipo.CursorLock
-    $vdd = $null; $added = $false
+    $sess = @{}       # id -> session (Id, Device, Index, Ours, IdleSince, Holders)
+    $errors = @{}     # id -> @{ error; at; ms }
+    # Displays a keeper that died left behind (another program, such as the ParsecVDisplay app,
+    # kept pinging them): this keeper owns them now and hands them out again or removes them.
+    $orphans = @()
+    if (Test-Path $ownedFile) {
+        try { $orphans = @(Get-Content $ownedFile -Raw | ConvertFrom-Json | Where-Object { $_.device }) } catch {}
+        $present = @(Get-ScreenList | Where-Object { $_.Virtual } | ForEach-Object { $_.Name })
+        $orphans = @($orphans | Where-Object { $present -contains $_.device })
+        if ($orphans.Count) { KLog "took over $($orphans.Count) display(s) left by a previous keeper: $(($orphans | ForEach-Object { "$($_.device)#$($_.index)" }) -join ' ')" }
+    }
+    function Save-Owned {
+        $list = @($sess.Values | Where-Object { $_.Ours } | ForEach-Object { [pscustomobject]@{ index = $_.Index; device = $_.Device; id = $_.Id } }) + @($orphans)
+        try { ConvertTo-Json -InputObject @($list) -Compress | Set-Content -Path $ownedFile } catch {}
+    }
+    function Remove-Owned([int]$index) {
+        try {
+            if (-not $script:vddRef) { $script:vddRef = [ModoEquipo.ParsecVdd]::Open() }
+            $script:vddRef.RemoveDisplay($index)
+        } catch { KLog "cannot remove display index=${index}: $($_.Exception.Message)" }
+    }
+    $script:vddRef = $null
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    $idleSince = 0.0
     try {
         Start-ClipWatchdog $PID $clipFile
         $lock.Start()
         while (-not $stop.WaitOne(1000)) {
-            # 1. Keep a second screen while the keeper runs (re-add it if it went away).
+            $now = $clock.ElapsedMilliseconds
             $screens = Get-ScreenList
-            if (-not @($screens | Where-Object { -not $_.Primary }).Count -and -not $added) {
-                try {
-                    if (-not $vdd) { $vdd = [ModoEquipo.ParsecVdd]::Open() }
-                    $i = $vdd.AddDisplay(); $added = $true
-                    KLog "added virtual display index=$i"
-                } catch { KLog "cannot add a display: $($_.Exception.Message)"; if (-not $vdd) { break } }
+            $names = @($screens | ForEach-Object { $_.Name })
+            $orphans = @($orphans | Where-Object { $names -contains $_.device })
+            $ids = @(Get-ChildItem -Path $script:SessionDir -Filter '*.txt' -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName.ToLowerInvariant() })
+
+            # 1. Every requested id gets its own screen (re-added if it went away).
+            foreach ($id in $ids) {
+                $s = $sess[$id]
+                if ($s -and $names -notcontains $s.Device) {
+                    KLog "screen $($s.Device) of '$id' went away"
+                    $sess.Remove($id); $s = $null
+                }
+                if ($s) { continue }
+                if ($errors[$id] -and ($now - $errors[$id].ms) -lt 10000) { continue }   # retry failures every 10 s
+                $pick = Select-ScreenFor $id $screens @($sess.Values | ForEach-Object { $_.Device }) $orphans
+                if ($pick.Kind -eq 'add') {
+                    $owned = @($sess.Values | Where-Object { $_.Ours }).Count + $orphans.Count
+                    if ($owned -ge $script:MaxDisplays) {
+                        $errors[$id] = @{ error = "all $script:MaxDisplays virtual displays are in use"; at = (Get-Date -Format s); ms = $now }
+                        KLog "no screen for '$id': $($errors[$id].error)"
+                        continue
+                    }
+                    try {
+                        if (-not $script:vddRef) { $script:vddRef = [ModoEquipo.ParsecVdd]::Open() }
+                        $index = $script:vddRef.AddDisplay()
+                        $new = Wait-NewScreen $names 10000
+                        if (-not $new) { $script:vddRef.RemoveDisplay($index); throw "Windows did not show the new display within 10 s" }
+                        $pick = [pscustomobject]@{ Kind = 'add'; Device = $new.Name; Index = $index }
+                        $screens = Get-ScreenList; $names = @($screens | ForEach-Object { $_.Name })
+                    } catch {
+                        $errors[$id] = @{ error = "cannot add a display: $($_.Exception.Message)"; at = (Get-Date -Format s); ms = $now }
+                        KLog "no screen for '$id': $($errors[$id].error)"
+                        continue
+                    }
+                }
+                if ($pick.Kind -eq 'orphan') { $orphans = @($orphans | Where-Object { $_.device -ne $pick.Device }) }
+                $sess[$id] = [pscustomobject]@{ Id = $id; Device = $pick.Device; Index = $pick.Index; Ours = ($pick.Kind -ne 'adopt'); IdleSince = $now; Holders = @(); Created = (Get-Date -Format s) }
+                $errors.Remove($id)
+                $b = ($screens | Where-Object { $_.Name -eq $pick.Device } | Select-Object -First 1).Bounds
+                KLog "'$id' -> $($pick.Device) ($($pick.Kind), index=$($pick.Index), at $($b.X),$($b.Y) $($b.Width)x$($b.Height))"
+                Save-Owned
             }
-            # 2. Mouse lock area.
+
+            # 2. Holders, releases and idle sessions.
+            foreach ($id in @($sess.Keys)) {
+                $s = $sess[$id]
+                $file = Join-Path $script:SessionDir "$id.txt"
+                $why = $null
+                if (Test-Path (Join-Path $script:SessionDir "$id.release")) { $why = 'released' }
+                elseif (-not (Test-Path $file)) { $why = 'request removed' }
+                else {
+                    $listed = @(Read-PidFile $file)
+                    $live = Get-LiveHolders $listed $script:IsAlive
+                    if ($live.Count -ne $listed.Count) { Write-PidFile $file $live }
+                    $s.Holders = $live
+                    if ($live.Count) { $s.IdleSince = $now }
+                    elseif (Test-KeeperIdle 0 $s.IdleSince $now $idleMinutes) { $why = "no holder for $idleMinutes min" }
+                }
+                if ($why) {
+                    if ($s.Ours) { Remove-Owned $s.Index }
+                    $sess.Remove($id)
+                    foreach ($f in "$id.txt", "$id.release") { Remove-Item (Join-Path $script:SessionDir $f) -ErrorAction SilentlyContinue }
+                    KLog "freed $($s.Device) of '$id' ($why)"
+                    Save-Owned
+                }
+            }
+            # Requests that failed are dropped (the caller got the error); stray release files too.
+            foreach ($id in @($errors.Keys)) {
+                if (($now - $errors[$id].ms) -ge 60000) { $errors.Remove($id) }
+                elseif (-not $sess[$id]) { Remove-Item (Join-Path $script:SessionDir "$id.txt") -ErrorAction SilentlyContinue }
+            }
+            Get-ChildItem -Path $script:SessionDir -Filter '*.release' -ErrorAction SilentlyContinue |
+                Where-Object { -not $sess[$_.BaseName.ToLowerInvariant()] } | Remove-Item -ErrorAction SilentlyContinue
+            # Displays left by a previous keeper that nobody claimed are removed.
+            if ($orphans.Count -and $clock.ElapsedMilliseconds -ge 15000) {
+                foreach ($o in $orphans) { Remove-Owned ([int]$o.index); KLog "removed unclaimed display $($o.device)#$($o.index)" }
+                $orphans = @(); Save-Owned
+            }
+
+            # 3. Mouse lock area: the real screens, whatever the number of virtual ones.
+            $screens = Get-ScreenList
             $h = Get-HomeRect $screens
             if ($h) { $lock.SetHome($h.X, $h.Y, $h.Width, $h.Height) } else { $lock.ClearHome() }
             $lock.Enabled = -not (Test-Path $offFile)
             try {
                 if ($lock.Engaged) { Set-Content -Path $clipFile -Value $lock.HomeText } elseif (Test-Path $clipFile) { Remove-Item $clipFile }
             } catch {}
-            # 3. Holders and idle time.
-            $live = Get-LiveHolders (Read-KeeperHolders) { param($p) [bool](Get-Process -Id $p -ErrorAction SilentlyContinue) }
-            Write-KeeperHolders $live
-            if ($live.Count) { $idleSince = $clock.ElapsedMilliseconds }
+
+            # 4. State for -Ensure / -Status / the viewer.
             try {
-                [pscustomobject]@{ pid = $PID; added = $added; holders = $live; lockArea = $lock.HomeText; lockEngaged = $lock.Engaged; updated = (Get-Date -Format s) } |
-                    ConvertTo-Json -Compress | Set-Content -Path $stateFile
+                $list = @($sess.Values | Sort-Object Id | ForEach-Object {
+                    $sd = $_.Device; $sb = ($screens | Where-Object { $_.Name -eq $sd } | Select-Object -First 1).Bounds
+                    [pscustomobject]@{ id = $_.Id; device = $_.Device; index = $_.Index; owned = $_.Ours; created = $_.Created; holders = @($_.Holders); x = $sb.X; y = $sb.Y; width = $sb.Width; height = $sb.Height }
+                })
+                $errs = @($errors.Keys | ForEach-Object { [pscustomobject]@{ id = $_; error = $errors[$_].error; at = $errors[$_].at } })
+                [pscustomobject]@{ version = $script:KeeperVersion; pid = $PID; sessions = $list; errors = $errs; lockArea = $lock.HomeText; lockEngaged = $lock.Engaged; updated = (Get-Date -Format s) } |
+                    ConvertTo-Json -Depth 4 -Compress | Set-Content -Path $stateFile
             } catch {}
-            if (Test-KeeperIdle $live.Count $idleSince $clock.ElapsedMilliseconds $idleMinutes) { KLog "idle for $idleMinutes min: stopping"; break }
+            $pending = @(Get-ChildItem -Path $script:SessionDir -Filter '*.txt' -ErrorAction SilentlyContinue).Count
+            if ($sess.Count -eq 0 -and $pending -eq 0 -and $orphans.Count -eq 0) { KLog 'no sessions left: stopping'; break }
         }
         if ($stop.WaitOne(0)) { KLog 'stop requested' }
     } finally {
         $lock.Stop()
-        if ($vdd) { $vdd.Dispose() }   # removes the display this keeper added
-        foreach ($f in $clipFile, $stateFile) { Remove-Item $f -ErrorAction SilentlyContinue }
+        foreach ($s in @($sess.Values | Where-Object { $_.Ours })) { Remove-Owned $s.Index; KLog "removed $($s.Device) of '$($s.Id)'" }
+        foreach ($o in $orphans) { Remove-Owned ([int]$o.index) }
+        if ($script:vddRef) { $script:vddRef.Dispose() }
+        foreach ($f in $clipFile, $stateFile, $ownedFile) { Remove-Item $f -ErrorAction SilentlyContinue }
+        Get-ChildItem -Path $script:SessionDir -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue
         KLog 'keeper stopped'
         $stop.Dispose()
         $single.ReleaseMutex(); $single.Dispose()
@@ -545,12 +759,17 @@ function Invoke-Keeper([int]$idleMinutes) {
 
 if ($Ensure -or $Release -or $Status) { [void][ModoEquipo.CursorLock]::SetProcessDpiAwarenessContext([IntPtr](-4)) }
 if ($Ensure) {
-    $r = Invoke-Ensure $HolderPid $IdleMinutes $TimeoutSeconds
+    try { $sid = Resolve-ScreenId $ScreenId } catch { [pscustomobject]@{ ok = $false; secondScreen = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress; exit 1 }
+    $r = Invoke-Ensure $sid $HolderPid $IdleMinutes $TimeoutSeconds
     $r | ConvertTo-Json -Compress
     exit $(if ($r.ok) { 0 } else { 1 })
 }
-if ($Release) { Invoke-Release | ConvertTo-Json -Compress; exit 0 }
-if ($Status) { Get-KeeperStatus | ConvertTo-Json -Depth 4 -Compress; exit 0 }
+if ($Release) {
+    $rid = $null
+    if ($ScreenId) { try { $rid = Resolve-ScreenId $ScreenId } catch { [pscustomobject]@{ ok = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress; exit 1 } }
+    Invoke-Release $rid | ConvertTo-Json -Compress; exit 0
+}
+if ($Status) { Get-KeeperStatus | ConvertTo-Json -Depth 5 -Compress; exit 0 }
 if ($Keep) { Invoke-Keeper $IdleMinutes; exit 0 }
 
 if ($SelfTest) {
@@ -579,6 +798,36 @@ if ($SelfTest) {
     Check 'idle: live holder keeps the screen' (-not (Test-KeeperIdle 1 0 (60 * 60000) 10))
     Check 'idle: stops after IdleMinutes without holders' (Test-KeeperIdle 0 0 (10 * 60000) 10)
     Check 'idle: not before IdleMinutes' (-not (Test-KeeperIdle 0 0 (9 * 60000) 10))
+    # Screen ids and which screen a session gets.
+    $savedCc = $env:CLAUDE_CODE_SESSION_ID
+    $env:MODO_EQUIPO_SCREEN_ID = ''; $env:CLAUDE_CODE_SESSION_ID = ''
+    Check 'id: default when none is given' ((Resolve-ScreenId '') -eq 'default')
+    $env:CLAUDE_CODE_SESSION_ID = '99A1426C-0f0d-4ce1-81f3-b92a627e9f91'
+    Check 'id: each Claude Code session gets its own id' ((Resolve-ScreenId '') -eq 'cc-99a1426c')
+    $env:MODO_EQUIPO_SCREEN_ID = 'QA-1'
+    Check 'id: MODO_EQUIPO_SCREEN_ID wins, lower case' ((Resolve-ScreenId '') -eq 'qa-1')
+    Check 'id: -ScreenId wins over both' ((Resolve-ScreenId 'dev') -eq 'dev')
+    $env:MODO_EQUIPO_SCREEN_ID = ''; $env:CLAUDE_CODE_SESSION_ID = $savedCc
+    $bad = $false; try { Resolve-ScreenId 'a b/c' | Out-Null } catch { $bad = $true }
+    Check 'id: rejects spaces and slashes' $bad
+    function S2($n, $p, $v) { [pscustomobject]@{ Name = $n; Primary = $p; Virtual = $v } }
+    $scr = @((S2 'D1' $true $false), (S2 'D5' $false $true), (S2 'D6' $false $true))
+    $orph = @([pscustomobject]@{ index = 3; device = 'D6'; id = 'qa' })
+    $k = Select-ScreenFor 'qa' $scr @() $orph
+    Check 'pick: an id gets its own display back after a keeper restart' ($k.Kind -eq 'orphan' -and $k.Device -eq 'D6' -and $k.Index -eq 3)
+    $k = Select-ScreenFor 'default' $scr @() $orph
+    Check 'pick: default takes a second screen that is already there' ($k.Kind -eq 'adopt' -and $k.Device -eq 'D5')
+    $k = Select-ScreenFor 'dev' $scr @('D5') @()
+    Check 'pick: another id never shares a screen, it gets a new display' ($k.Kind -eq 'add')
+    $k = Select-ScreenFor 'dev' $scr @('D5') $orph
+    Check 'pick: an unclaimed display the keeper owns is reused' ($k.Kind -eq 'orphan' -and $k.Device -eq 'D6')
+    $k = Select-ScreenFor 'qa' $scr @('D6') $orph
+    Check 'pick: a display another session holds is not handed out' ($k.Kind -eq 'add')
+    $k = Select-ScreenFor 'qa' @((S2 'D1' $true $false)) @() $orph
+    Check 'pick: a display that went away is not handed out' ($k.Kind -eq 'add')
+    $hr = Get-HomeRect @((Scr 0 0 1920 1080 $false), (Scr 1920 0 1920 1080 $true), (Scr 3840 0 1920 1080 $true), (Scr 5760 0 1920 1080 $true))
+    Check 'lock area: main + three virtual -> main' ($hr -and $hr.X -eq 0 -and $hr.Width -eq 1920)
+    Check 'display limit follows parsec-vdd.h' ($script:MaxDisplays -eq 8)
     $d = [ModoEquipo.CursorLock]::Desktop()
     Check 'desktop rectangle is readable' (($d.Right - $d.Left) -gt 0 -and ($d.Bottom - $d.Top) -gt 0)
     # Driver state is informational: a machine without the driver still passes.

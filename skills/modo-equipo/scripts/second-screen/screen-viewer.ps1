@@ -2,7 +2,9 @@ param(
     [switch]$SelfTest,
     [switch]$Smoke,
     [int]$SmokeSeconds = 5,
-    [string]$SmokeOn = ''
+    [string]$SmokeOn = '',
+    [string]$Screen = '',
+    [string]$ScreenId = ''
 )
 # Live, touch-style view of the second screen, shown on the main screen.
 # Moving the pointer over the image puts the real cursor on the second screen (direct mode):
@@ -16,8 +18,11 @@ param(
 # The window has no Windows title bar: a thin strip on top moves it and its edges resize it.
 # The toolbar is a small rounded pill docked at the top centre (of the window, or of the screen
 # in full screen): it rests as a thin handle, opens while the pointer is near it, can be slid
-# along the top edge from its grip, and holds always-on-top, pointer, mute, mouse lock, full
-# screen, keep-open, minimize and close.
+# along the top edge from its grip, and holds always-on-top, pointer, mute, mouse lock, next
+# screen (when there are several), full screen, keep-open, minimize and close.
+# -Screen <device> shows that screen (for example \\.\DISPLAY6); -ScreenId <id> names the
+# screen keeper session it belongs to, so the viewer follows it if the keeper gives that session
+# a new display. Without them it shows the first second screen.
 # -SelfTest runs the layout checks without opening any window (exit code 0 = pass).
 # -Smoke opens the viewer on the second screen for a few seconds, without direct mode, and
 # prints which renderer it used (developer check). Halfway through it opens the toolbar.
@@ -898,6 +903,13 @@ function Get-EdgePush([int]$x, [int]$y, $bounds, [int]$rawX, [int]$rawY, $push, 
     return [pscustomobject]@{ X = $nx; Y = $ny; OverX = $ox; OverY = $oy }
 }
 
+# Name of the screen after $current in $names (wraps around); the first one when $current is unknown.
+function Get-NextScreenName([string[]]$names, [string]$current) {
+    if (-not $names -or $names.Count -eq 0) { return $null }
+    $i = [Array]::IndexOf($names, $current)
+    return $names[($i + 1) % $names.Count]
+}
+
 if ($SelfTest) {
     $fail = 0; $total = 0
     function Check([bool]$ok, [string]$what) { $script:total++; if (-not $ok) { $script:fail++; Write-Output "FAIL $what" } }
@@ -962,6 +974,11 @@ if ($SelfTest) {
     $left = [SvDrive]::Advance([ref]$x, [ref]$y, 5, 0, 0.5, $sb, $true, [ref]$ox, [ref]$oy)
     Check (-not $left -and $x -eq 3839) "drive clamps while a button is held got=$x"
     Check (-not [SvAutoMute]::On) "auto mute starts off"
+    # Next-screen button order.
+    Check ((Get-NextScreenName @('A', 'B', 'C') 'A') -eq 'B') "next screen after A"
+    Check ((Get-NextScreenName @('A', 'B', 'C') 'C') -eq 'A') "next screen wraps around"
+    Check ((Get-NextScreenName @('A', 'B') 'gone') -eq 'A') "next screen from a removed one starts at the first"
+    Check ($null -eq (Get-NextScreenName @() 'A')) "next screen with none"
     # Always on top: small window only.
     Check ([SvNative]::WantTopMost($false, $true)) "small window follows the always-on-top toggle (on)"
     Check (-not [SvNative]::WantTopMost($false, $false)) "small window follows the always-on-top toggle (off)"
@@ -999,11 +1016,36 @@ $script:dpiMode = Set-PerMonitorDpi
 # Hide only the console window, so the viewer form itself stays visible.
 if (-not $Smoke) { [SvNative]::ShowWindow([SvNative]::GetConsoleWindow(), 0) | Out-Null }
 
+# Which second screen the viewer shows: -Screen, the keeper session -ScreenId, or the first one.
+$script:target = $Screen
+$script:targetId = $ScreenId
+$script:keeperJson = Join-Path $env:USERPROFILE '.claude\modo-equipo\screen-keeper-v2\keeper.json'
+function Get-SessionDevice([string]$id) {
+    if (-not $id -or -not (Test-Path $script:keeperJson)) { return $null }
+    try { (Get-Content $script:keeperJson -Raw | ConvertFrom-Json).sessions | Where-Object { $_.id -eq $id } | Select-Object -First 1 -ExpandProperty device } catch { $null }
+}
+function Get-SessionOf([string]$device) {
+    if (-not (Test-Path $script:keeperJson)) { return $null }
+    try { (Get-Content $script:keeperJson -Raw | ConvertFrom-Json).sessions | Where-Object { $_.device -eq $device } | Select-Object -First 1 -ExpandProperty id } catch { $null }
+}
+function Get-OtherScreens { @([Windows.Forms.Screen]::AllScreens | Where-Object { -not $_.Primary } | Sort-Object { $_.Bounds.X }, { $_.Bounds.Y }) }
 function Get-SecondScreen {
-    [Windows.Forms.Screen]::AllScreens | Where-Object { -not $_.Primary } | Select-Object -First 1
+    $all = Get-OtherScreens
+    if ($script:target) {
+        $s = $all | Where-Object { $_.DeviceName -eq $script:target } | Select-Object -First 1
+        if ($s) { return $s }
+        if ($script:targetId) {
+            $d = Get-SessionDevice $script:targetId
+            $s = $all | Where-Object { $_.DeviceName -eq $d } | Select-Object -First 1
+            if ($s) { $script:target = $d; return $s }
+        }
+        return $null   # the chosen screen is gone: never jump to another session's screen
+    }
+    $all | Select-Object -First 1
 }
 
 $screen = Get-SecondScreen
+if (-not $screen -and $script:target) { $script:target = ''; $screen = Get-SecondScreen }   # asked-for screen not there yet
 if (-not $screen) {
     [Windows.Forms.MessageBox]::Show("No second screen found. Connect a monitor or add a virtual display first.", "Screen viewer") | Out-Null
     exit 1
@@ -1046,10 +1088,19 @@ $script:magOk = $false
 $script:pic = $null
 $script:magBounds = $null
 $script:clock = [Diagnostics.Stopwatch]::StartNew()
+$script:screensCheckMs = -10000
+$script:screensSig = ''
 $script:lastFrameMs = -1000
 
 # --- main window ----------------------------------------------------------------------------
 $form = New-Object SvForm
+function Update-Title {
+    $s = Get-SecondScreen
+    if (-not $s) { return }
+    $short = $s.DeviceName -replace '^\\\\\.\\', ''
+    $id = Get-SessionOf $s.DeviceName
+    $form.Text = "Test screen $short$(if ($id) { " ($id)" }) - live, touch"
+}
 $form.Text = "Test screen (live, touch)"
 $form.FormBorderStyle = 'None'
 $form.TopMost = $true
@@ -1109,6 +1160,7 @@ $btnPin     = New-BarButton 'pin'
 $btnPointer = New-BarButton 'pointer'
 $btnMute    = New-BarButton 'mute'
 $btnLock    = New-BarButton 'lock'
+$btnScreen  = New-BarButton 'screen'
 $btnFull    = New-BarButton 'full' $true
 $btnKeep    = New-BarButton 'keep'
 $btnMin     = New-BarButton 'min' $true
@@ -1122,6 +1174,7 @@ $bar.Add_ButtonClick({
         'pointer' { Switch-Pointer }
         'mute'    { Switch-Mute }
         'lock'    { Switch-Lock }
+        'screen'  { Switch-Screen }
         'full'    { Set-Fullscreen (-not $script:full) }
         'keep'    { Switch-KeepBar }
         'min'     { $form.WindowState = 'Minimized' }
@@ -1140,6 +1193,7 @@ function Apply-TopMost {
 
 function Update-ToolbarSize {
     $btnPin.Visible = -not $script:full   # "always on top" only exists for the small window
+    $btnScreen.Visible = (Get-OtherScreens).Count -gt 1   # only when there is another screen to show
     $bar.Redraw()
 }
 
@@ -1154,6 +1208,15 @@ function Update-Glyphs {
     $btnMute.Glyph = if ($muteOn) { [string][char]0xE74F } else { [string][char]0xE767 }
     $btnMute.On = $muteOn
     $btnMute.Tip = if ($muteOn) { "Second screen sound: muted (the apps on that screen, including ones that start playing later). Click to unmute" } else { "Second screen sound: on. Click to mute the apps on that screen (Windows has no per-screen mute)" }
+    $cur = Get-SecondScreen
+    $others = Get-OtherScreens
+    $btnScreen.Glyph = [string][char]0xE7F4
+    $btnScreen.On = $false
+    if ($cur) {
+        $pos = [Array]::IndexOf(@($others | ForEach-Object { $_.DeviceName }), $cur.DeviceName) + 1
+        $sid = Get-SessionOf $cur.DeviceName
+        $btnScreen.Tip = "Showing screen $pos of $($others.Count): $($cur.DeviceName -replace '^\\\\\.\\', '')$(if ($sid) { " (session $sid)" }). Click for the next one"
+    }
     $lockOn = -not (Test-Path $script:lockOffFile)
     $btnLock.Glyph = if ($lockOn) { [string][char]0xE72E } else { [string][char]0xE785 }
     $btnLock.On = $lockOn
@@ -1222,13 +1285,13 @@ function Set-Fullscreen([bool]$on) {
 # while in direct mode, so the keeper lifts its clip, and (b) turns the lock on or off through
 # the keeper's flag file. If the viewer dies in direct mode the mutex is abandoned and the
 # keeper takes the lock back.
-$script:lockOffFile = Join-Path $env:USERPROFILE '.claude\modo-equipo\screen-keeper\lock-off'
+$script:lockOffFile = Join-Path $env:USERPROFILE '.claude\modo-equipo\screen-keeper-v2\lock-off'
 $script:freeMutex = New-Object Threading.Mutex($false, 'Local\ModoEquipo.CursorFree')
 $script:freeOwned = $false
 
 function Test-KeeperOn {
     $m = $null
-    try { return [Threading.Mutex]::TryOpenExisting('Local\ModoEquipo.ScreenKeeper', [ref]$m) } finally { if ($m) { $m.Dispose() } }
+    try { return [Threading.Mutex]::TryOpenExisting('Local\ModoEquipo.ScreenKeeper-v2', [ref]$m) } finally { if ($m) { $m.Dispose() } }
 }
 
 # Before the cursor goes onto the second screen: take the mutex and give the keeper a moment to
@@ -1254,6 +1317,22 @@ function Switch-Lock {
     } catch { Write-ViewerLog "mouse lock switch failed: $($_.Exception.Message)" }
     Write-ViewerLog "mouse lock=$(-not (Test-Path $script:lockOffFile))"
     Update-Glyphs
+}
+
+function Switch-Screen {
+    $names = @(Get-OtherScreens | ForEach-Object { $_.DeviceName })
+    $cur = Get-SecondScreen
+    $next = Get-NextScreenName $names $(if ($cur) { $cur.DeviceName } else { '' })
+    if (-not $next) { return }
+    if ($script:remote) { [SvDrive]::Stop(); $script:remote = $false; Return-CursorFree }
+    $script:target = $next
+    $script:targetId = Get-SessionOf $next
+    $script:magBounds = $null
+    Update-MagLayout
+    Update-Title
+    Write-ViewerLog "showing $next session=$($script:targetId)"
+    Update-Glyphs
+    $bar.Redraw()
 }
 
 function Switch-Pointer {
@@ -1424,6 +1503,11 @@ $timer.Add_Tick({
     }
     $b = $s.Bounds
     if ([SvAutoMute]::On) { [SvAutoMute]::SetArea($b) }
+    if (($script:clock.ElapsedMilliseconds - $script:screensCheckMs) -ge 1000) {
+        $script:screensCheckMs = $script:clock.ElapsedMilliseconds
+        $sig = (@(Get-OtherScreens | ForEach-Object { $_.DeviceName }) -join ',') + '|' + $s.DeviceName
+        if ($sig -ne $script:screensSig) { $script:screensSig = $sig; Update-Title; Update-ToolbarSize; Update-Glyphs }
+    }
     $now = $script:clock.ElapsedMilliseconds
     $cur = [Windows.Forms.Cursor]::Position
     # Drain the raw motion and the hotkey every tick so old motion never counts later.

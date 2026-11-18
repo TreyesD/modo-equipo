@@ -1,17 +1,18 @@
-param([switch]$NoEnsure)
+param([switch]$NoEnsure, [string]$ScreenId = '')
 # Prints one JSON object describing whether a second screen is available.
-# When there is none and the Parsec Virtual Display Driver is installed, it first asks the screen
-# keeper (parsec-vdd.ps1 -Ensure) for a virtual one, which stays for the keeper's idle time
-# (launchers then register their programs as holders). -NoEnsure only looks.
+# It first asks the screen keeper (parsec-vdd.ps1 -Ensure) for this session's own screen (the id
+# is -ScreenId, else MODO_EQUIPO_SCREEN_ID, else 'default'); "screen" names it. That screen stays
+# for the keeper's idle time (launchers then register their programs as holders). -NoEnsure only
+# looks, and "screen" is then the first second screen.
 # Windows PowerShell 5.1+ only. Exit code is always 0; read the JSON.
 $ErrorActionPreference = 'Stop'
 try {
     Add-Type -AssemblyName System.Windows.Forms
     $keeperResult = $null
     $keeper = Join-Path $PSScriptRoot 'parsec-vdd.ps1'
-    $hasSecond = @([Windows.Forms.Screen]::AllScreens | Where-Object { -not $_.Primary }).Count -gt 0
-    if (-not $hasSecond -and -not $NoEnsure -and $env:MODO_EQUIPO_NO_SECOND_SCREEN -ne '1' -and (Test-Path $keeper)) {
-        try { $keeperResult = ("$(& $keeper -Ensure)" | ConvertFrom-Json) } catch {}
+    if (-not $NoEnsure -and $env:MODO_EQUIPO_NO_SECOND_SCREEN -ne '1' -and (Test-Path $keeper)) {
+        $ensureArgs = @('-Ensure'); if ($ScreenId) { $ensureArgs += @('-ScreenId', $ScreenId) }
+        try { $keeperResult = ("$(& $keeper @ensureArgs)" | ConvertFrom-Json) } catch {}
         [Windows.Forms.Screen].GetField('screens', [Reflection.BindingFlags]'NonPublic,Static').SetValue($null, $null)
     }
     $screens = @([Windows.Forms.Screen]::AllScreens | ForEach-Object {
@@ -33,6 +34,8 @@ try {
         screenCount  = $screens.Count
         screens      = $screens
         keeper       = $(if ($keeperResult) { $keeperResult.keeper } else { $null })
+        screenId     = $(if ($keeperResult) { $keeperResult.id } else { $null })
+        screen       = $(if ($second.Count -eq 0) { $null } elseif ($keeperResult -and $keeperResult.ok) { $keeperResult.screen } else { $second[0].name })
     } | ConvertTo-Json -Depth 4 -Compress
 } catch {
     [pscustomobject]@{ ok = $false; secondScreen = $false; error = $_.Exception.Message } | ConvertTo-Json -Compress

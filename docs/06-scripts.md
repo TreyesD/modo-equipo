@@ -71,11 +71,11 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 
 ## second-screen/detect.ps1
 
-**En simple:** responde si Windows ve una segunda pantalla; si no hay y el driver de Parsec está instalado, primero pide una al guardián de pantalla.
+**En simple:** responde si Windows ve una segunda pantalla; antes le pide al guardián la pantalla de esta sesión (si el driver de Parsec está instalado).
 
 **Contrato:**
-- Uso: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/second-screen/detect.ps1`
-- Imprime un JSON: `ok`, `secondScreen` (true/false), `screenCount`, `screens` (nombre, primaria, x, y, ancho, alto), `keeper` (lo que respondió `parsec-vdd.ps1 -Ensure`, o null). Siempre termina con código 0; leer el JSON.
+- Uso: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/second-screen/detect.ps1 [-ScreenId <id>]` (sin `-ScreenId` usa `MODO_EQUIPO_SCREEN_ID`, si no la sesión de Claude Code (`cc-` + 8 caracteres de `CLAUDE_CODE_SESSION_ID`), si no `default`).
+- Imprime un JSON: `ok`, `secondScreen` (true/false), `screenCount`, `screens` (nombre, primaria, x, y, ancho, alto), `keeper` (lo que respondió `parsec-vdd.ps1 -Ensure`, o null), `screenId` y `screen` (la pantalla de esta sesión; con `-NoEnsure`, la primera segunda pantalla). Siempre termina con código 0; leer el JSON.
 - `-NoEnsure`: solo mira, no pide pantalla.
 - Variable de prueba: `MODO_EQUIPO_NO_SECOND_SCREEN=1` simula que no hay segunda pantalla.
 
@@ -84,9 +84,9 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 **En simple:** abre la ventana de pruebas directamente en la segunda pantalla y vuelve enseguida.
 
 **Contrato:**
-- Uso: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/second-screen/launch-on-second-screen.ps1 -Root "<carpeta del proyecto>"`
-- Código 0 e imprime `LAUNCHED pid=<n> screen=<nombre>`: lanzó `run-tests.ps1` en la segunda pantalla.
-- Si no hay segunda pantalla, la pide al guardián (`parsec-vdd.ps1 -Ensure`) y registra al corredor como proceso que la mantiene: la pantalla sigue hasta que terminan las pruebas (más el tiempo de espera del guardián).
+- Uso: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/second-screen/launch-on-second-screen.ps1 -Root "<carpeta del proyecto>" [-ScreenId <id>]`
+- Código 0 e imprime `LAUNCHED pid=<n> screen=<nombre>`: lanzó `run-tests.ps1` en la pantalla de esta sesión.
+- Pide al guardián (`parsec-vdd.ps1 -Ensure`) la pantalla de la sesión (`-ScreenId`, si no `MODO_EQUIPO_SCREEN_ID`, si no la sesión de Claude Code, si no `default`; una sesión nueva recibe un monitor virtual nuevo) y registra al corredor como proceso que la mantiene: la pantalla sigue hasta que terminan las pruebas (más el tiempo de espera del guardián). Sin guardián usa la primera segunda pantalla.
 - Código 2 e imprime `NO_SECOND_SCREEN`: no hubo pantalla ni guardián que la diera; no lanzó nada; correr las pruebas de la forma normal.
 - Respeta `MODO_EQUIPO_NO_SECOND_SCREEN=1`.
 
@@ -95,8 +95,8 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 **En simple:** abre cualquier programa con ventana (emulador, juego, app de escritorio) directo en la segunda pantalla. Ninguna de sus ventanas se ve en tu pantalla principal, ni por un instante. Es la forma por defecto de abrir un programa de prueba con ventana en Windows.
 
 **Contrato:**
-- Uso: `PY -I scripts/second-screen/launch_offscreen.py [--screen N|auto] [--timeout S] [--keep-watch S] [--trace] [--no-ensure] -- <exe> [args...]`. Todo lo que va después de `--` es el comando, tal cual.
-- Sin segunda pantalla, la pide al guardián (`parsec-vdd.ps1 -Ensure`, sin ventana de consola) y registra el programa lanzado como proceso que la mantiene. `--no-ensure` lo evita; `MODO_EQUIPO_NO_SECOND_SCREEN=1` también.
+- Uso: `PY -I scripts/second-screen/launch_offscreen.py [--screen N|auto] [--timeout S] [--keep-watch S] [--trace] [--no-ensure] [--screen-id ID] -- <exe> [args...]`. Todo lo que va después de `--` es el comando, tal cual.
+- Con `--screen auto` pide al guardián (`parsec-vdd.ps1 -Ensure`, sin ventana de consola) la pantalla de esta sesión (`--screen-id`, si no `MODO_EQUIPO_SCREEN_ID`, si no la sesión de Claude Code, si no `default`), pone el programa ahí y lo registra como proceso que la mantiene. `--no-ensure` lo evita y usa la primera segunda pantalla; `MODO_EQUIPO_NO_SECOND_SCREEN=1` también.
 - `--list`: imprime las pantallas (`index`, `name`, `primary`, `rect`, `work`) para elegir `--screen N` (debe ser una no primaria). `auto` (por defecto) usa la primera no primaria.
 - `--timeout` (15 s): espera máxima a la primera ventana. `--keep-watch` (10 s): sigue vigilando ventanas nuevas (diálogos, ventanas de procesos hijos) ese tiempo después de la primera. `--trace`: agrega cada evento de ventana observado.
 - Método: crea el proceso suspendido y minimizado sin activar (`CREATE_SUSPENDED`, `SW_SHOWMINNOACTIVE`), engancha un `SetWinEventHook` fuera de proceso antes de reanudarlo y, en la primera aparición, fija la posición restaurada en la segunda pantalla (`SetWindowPlacement`, `SW_SHOWNOACTIVATE`). Guardia: cualquier ventana visible que toque la principal se vuelve transparente, se mueve y vuelve a ser opaca. Trabaja en píxeles reales (DPI por monitor). Sigue también a los procesos hijos.
@@ -150,7 +150,7 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 - `-Smoke [-SmokeSeconds N] [-SmokeOn <pantalla>]`: abre el visor unos segundos en la segunda pantalla (o en la pantalla indicada, por ejemplo `\\.\DISPLAY6`, útil para capturas cuando otra ventana tapa la segunda), sin modo directo; a la mitad abre la barra e imprime qué motor de imagen usó y dónde quedó la barra (chequeo de desarrollo).
 - `MODO_EQUIPO_VIEWER_LOG=<archivo>`: registra los eventos para diagnosticar.
 - Sin segunda pantalla: muestra un aviso y termina con código 1.
-- Mouse en la pantalla principal: lo confina el guardián (`parsec-vdd.ps1`). El visor toma el mutex `Local\ModoEquipo.CursorFree` en modo directo para que el guardián suelte el cursor, y el botón del candado escribe o borra `~/.claude/modo-equipo/screen-keeper/lock-off`.
+- Mouse en la pantalla principal: lo confina el guardián (`parsec-vdd.ps1`). El visor toma el mutex `Local\ModoEquipo.CursorFree` en modo directo para que el guardián suelte el cursor, y el botón del candado escribe o borra `~/.claude/modo-equipo/screen-keeper-v2/lock-off`.
 
 ## second-screen/open-viewer.ps1
 
@@ -158,7 +158,7 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 
 **Contrato:**
 - Uso: `powershell -NoProfile -ExecutionPolicy Bypass -STA -File scripts/second-screen/open-viewer.ps1`. Lo normal es usarlo desde el acceso directo (`install-desktop-shortcut.ps1`).
-- Llama a `parsec-vdd.ps1 -Ensure -HolderPid <su pid>`: el guardián agrega la pantalla si falta (y activa el candado del mouse si es virtual). El visor queda registrado como proceso que la mantiene: la pantalla sigue mientras está abierto y, al cerrarlo, durante el tiempo de espera del guardián (10 min), por si hay pruebas que la usan.
+- Llama a `parsec-vdd.ps1 -Ensure -HolderPid <su pid>` para la sesión `-ScreenId <id>` (si no `MODO_EQUIPO_SCREEN_ID`, si no la sesión de Claude Code; desde el acceso directo, sin ningún nombre, cada apertura crea una pantalla virtual NUEVA, sesión `viewer-<pid>`, para que las pruebas de las sesiones del equipo, que usan su propia pantalla, nunca caigan en la que estás usando; `-NewScreen` lo fuerza) y abre el visor en esa pantalla: el guardián agrega la pantalla si falta (y activa el candado del mouse si es virtual). El visor queda registrado como proceso que la mantiene: la pantalla sigue mientras está abierto y, al cerrarlo, durante el tiempo de espera del guardián (10 min), por si hay pruebas que la usan.
 - `-Smoke`: chequeo de desarrollo. Hace el mismo `-Ensure`, imprime su respuesta y abre el visor en su modo `-Smoke` unos segundos.
 - Plan de respaldo, solo si el guardián no puede dar una pantalla (no instalado, sin acceso o sin respuesta): localiza `ParsecVDisplay.exe` (variable `PARSECVDISPLAY_EXE`, archivo `~/.claude/modo-equipo/parsecvdisplay-path.txt`, proceso en ejecución o carpetas habituales), pulsa el botón por UI Automation (sin mover el mouse) y espera hasta 20 s a que Windows reporte la pantalla.
 - Si el driver falla y no encuentra `ParsecVDisplay.exe`, muestra el motivo del fallo del driver, indica la guía de instalación (`references/second-screen.md`, opción B) y pregunta al dueño: elegir el .exe con un selector de archivos (la ruta queda guardada), abrir el visor igual o no hacer nada. Nunca busca en el disco ni descarga.
@@ -167,18 +167,20 @@ Todas las rutas son relativas a la carpeta de la skill (`skills/modo-equipo/`). 
 
 ## second-screen/parsec-vdd.ps1
 
-**En simple:** el control remoto del driver de pantalla virtual de Parsec, y el "guardián de pantalla": un proceso oculto que mantiene la pantalla virtual mientras alguien la necesite (el visor, el corredor de pruebas, un emulador) y mantiene tu mouse en tu pantalla mientras ella exista.
+**En simple:** el control remoto del driver de pantalla virtual de Parsec, y el "guardián de pantalla": un proceso oculto que le da a cada sesión de pruebas su propio monitor virtual mientras lo necesite (el visor, el corredor de pruebas, un emulador) y mantiene tu mouse en tu pantalla mientras exista alguno.
 
 **Contrato:**
-- `-Ensure [-HolderPid <pid>,...] [-IdleMinutes N] [-TimeoutSeconds S]`: asegura una segunda pantalla. Arranca el guardián (o usa el que ya corre), espera a que Windows la reporte e imprime una línea JSON (`ok`, `secondScreen`, `keeper` = `started` \| `running` \| `not-needed` \| `none`, `screen`, `error`). Código 0 = hay segunda pantalla; 1 = no se pudo (por ejemplo, sin driver). Los `HolderPid` son procesos que la mantienen viva mientras corren; cuando termina el último (o si no se dio ninguno), el guardián espera `IdleMinutes` (10 por defecto), quita la pantalla y se cierra. Con un monitor real y sin pantalla virtual no arranca nada (`not-needed`).
-- `-Release`: detiene el guardián ya (quita su pantalla y libera el mouse). `-Status`: JSON con el estado (guardián, pantalla agregada, área del candado, candado encendido, procesos que la mantienen, pantallas).
-- Guardián: un solo proceso (mutex `Local\ModoEquipo.ScreenKeeper`), sin ventana, con registro en `~/.claude/modo-equipo/screen-keeper/keeper.log`. Si la pantalla desaparece mientras corre, la vuelve a agregar. Al cerrarse quita solo la pantalla que agregó.
-- Candado del mouse: mientras haya una pantalla virtual (adaptador Parsec u otro "Virtual Display"), confina el cursor con `ClipCursor` al rectángulo de las pantallas reales. Lo libera al instante mientras haya un botón apretado (revisa cada 10 ms; así puedes arrastrar una ventana hacia allá) y mientras el visor tenga el mutex `Local\ModoEquipo.CursorFree` (su modo directo; si el visor muere con él, el guardián lo recupera). Solo lo vuelve a aplicar si nadie más tiene el cursor confinado (no pelea con juegos). No lo aplica si una pantalla virtual queda entre pantallas reales. El archivo `screen-keeper/lock-off` lo apaga (lo escribe el botón del candado del visor).
+- `-Ensure [-ScreenId <id>] [-HolderPid <pid>,...] [-IdleMinutes N] [-TimeoutSeconds S]`: asegura la pantalla de la sesión `<id>` (si no se da, `MODO_EQUIPO_SCREEN_ID`; si tampoco, la sesión de Claude Code (`cc-` + 8 caracteres de `CLAUDE_CODE_SESSION_ID`), así cada sesión de Claude tiene su pantalla sin configurar nada; si tampoco, `default`; letras, números, `.`, `_` y `-`, hasta 40). Arranca el guardián (o usa el que ya corre); una sesión nueva recibe un monitor virtual nuevo y una conocida recibe el mismo de antes. Espera a que Windows lo reporte e imprime una línea JSON (`ok`, `secondScreen`, `keeper` = `started` \| `running` \| `not-needed` \| `no-driver` \| `none`, `id`, `screen`, `x`, `y`, `width`, `height`, `shared`, `error`). Código 0 = la sesión tiene pantalla; 1 = no se pudo (sin driver y sin segunda pantalla, o las 8 pantallas en uso). Los `HolderPid` mantienen viva la pantalla de esa sesión mientras corren; cuando termina el último (o si no se dio ninguno), la sesión dura `IdleMinutes` más (10 por defecto) y su pantalla se quita. El guardián se cierra cuando no queda ninguna sesión.
+- La sesión `default` usa primero una segunda pantalla que ya exista (un monitor real, o una virtual de otro programa) y nunca la quita; con un monitor real y sin pantalla virtual no arranca nada (`not-needed`). Las demás sesiones siempre reciben un monitor propio. Sin driver todas comparten la segunda pantalla que haya (`shared: true`). Un guardián viejo (de antes de las sesiones, de una sola pantalla) puede seguir vivo con su pantalla: no se comparte con las sesiones nuevas (el guardián nuevo tiene su propia carpeta `screen-keeper-v2` y su propio mutex) y se cierra solo.
+- `-Release -ScreenId <id>`: quita ya la pantalla de esa sesión. `-Release` solo: detiene el guardián (quita todas sus pantallas y libera el mouse). `-Status`: JSON con el estado (versión, sesiones con su pantalla, posición y procesos que la mantienen, errores, área del candado, candado encendido, pantallas).
+- Guardián: un solo proceso (mutex `Local\ModoEquipo.ScreenKeeper-v2`), sin ventana, con registro en `~/.claude/modo-equipo/screen-keeper-v2/keeper.log` y las peticiones de cada sesión en `screen-keeper-v2/sessions/<id>.txt`. Hasta 8 pantallas virtuales propias (`VDD_MAX_DISPLAYS` de `parsec-vdd.h`). Si la pantalla de una sesión desaparece mientras corre, le pone otra. Al cerrarse quita solo las pantallas que agregó.
+- Si el guardián muere de golpe y otro programa mantiene vivas sus pantallas (la app ParsecVDisplay da señal de vida a todas), el siguiente guardián las encuentra en `screen-keeper-v2/owned.json`: devuelve a cada sesión su pantalla de antes y quita a los 15 s las que nadie reclama.
+- `MODO_EQUIPO_KEEPER_TAG=<nombre>`: un guardián aparte (otra carpeta de estado y otros nombres), para probar una copia de desarrollo junto al que usan las sesiones.
+- Candado del mouse: mientras haya una pantalla virtual (adaptador Parsec u otro "Virtual Display"), confina el cursor con `ClipCursor` al rectángulo de las pantallas reales. Lo libera al instante mientras haya un botón apretado (revisa cada 10 ms; así puedes arrastrar una ventana hacia allá) y mientras el visor tenga el mutex `Local\ModoEquipo.CursorFree` (su modo directo; si el visor muere con él, el guardián lo recupera). Solo lo vuelve a aplicar si nadie más tiene el cursor confinado (no pelea con juegos). No lo aplica si una pantalla virtual queda entre pantallas reales. El archivo `screen-keeper-v2/lock-off` lo apaga (lo escribe el botón del candado del visor).
 - El confinamiento sobrevive al proceso que lo puso (comprobado en Windows 10), así que el guardián deja un proceso vigía oculto que lo libera si el guardián muere.
 - Se carga con `. .\parsec-vdd.ps1` y define `[ModoEquipo.ParsecVdd]`: `Open()`, `AddDisplay()` (devuelve el índice), `RemoveDisplay(i)`, `Version()`, `MonitorCount()` y `Dispose()` (quita las pantallas que agregó ese objeto, detiene la señal de vida y cierra el driver).
 - Busca la interfaz del driver con SetupAPI (GUID `{00b41627-04c4-429e-a26e-0265cf50c8fa}`) y le envía los IOCTL de `parsec-vdd.h` del proyecto nomi-san/parsec-vdd (licencia BSD de 2 cláusulas, ver `NOTICE`). Envía la señal de vida cada 50 ms (el driver la pide al menos cada 100 ms). No necesita administrador.
-- Si la app ParsecVDisplay está abierta, su señal de vida mantiene también las pantallas de un guardián que murió de golpe; `-Status` y `keeper.log` ayudan a verlo.
-- `-SelfTest`: comprueba los códigos IOCTL contra `CTL_CODE`, el formato del índice, el intervalo de la señal, el área del candado, los procesos que la mantienen y la parada por inactividad; si el driver está, informa su versión. Nunca agrega pantallas (código 0 = pasa).
+- `-SelfTest`: comprueba los códigos IOCTL contra `CTL_CODE`, el formato del índice, el intervalo de la señal, el área del candado (también con varias pantallas virtuales), los procesos que la mantienen, la parada por inactividad, los nombres de sesión y qué pantalla recibe cada sesión; si el driver está, informa su versión. Nunca agrega pantallas (código 0 = pasa).
 
 ## second-screen/install-desktop-shortcut.ps1
 
