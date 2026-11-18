@@ -141,6 +141,7 @@ Commands:
 - Hash them: the same command with `--hash`.
 
 Check (Step 0, every activation; read-only):
+0. If `~/.claude/CLAUDE.md` has no `<!-- gentle-ai:* -->` blocks (the user removed them to save tokens; this skill does not need them), skip this check and the "Gentle AI is OFF" section, say so in one line, and continue. A `gentle-ai` update or sync may put the blocks back: if they reappear, tell the user in one line that they cost about 20k tokens per session and can be removed again.
 1. If the baseline folder does not exist, create it from the current version and blocks. If that version is not 4.4.0, tell the user in one line that the skill's rules come from 4.4.0 and a port review is available. Continue.
 2. Otherwise compare `gentle-ai --version` and the hash with the baseline.
 3. If both match, continue silently.
