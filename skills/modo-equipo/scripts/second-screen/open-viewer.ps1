@@ -2,8 +2,9 @@
 # from the same folder. The screen comes from the background screen keeper (parsec-vdd.ps1
 # -Ensure), which talks to the installed Parsec Virtual Display Driver directly: no
 # ParsecVDisplay window. The viewer is registered as a holder, so the screen stays while the
-# viewer is open and for the keeper's idle time after it closes (tests may still need it); the
-# keeper also keeps the mouse on the main screen. The ParsecVDisplay app is never started; if the
+# viewer is open (a desktop-shortcut session, 'viewer-<pid>', turns into a spare as soon as the
+# viewer closes, so reopening reuses it without adding a monitor; a named session keeps it for the
+# keeper's idle time); the keeper also keeps the mouse on the main screen. The ParsecVDisplay app is never started; if the
 # driver cannot be used, an error with the real reason is shown.
 # The screen belongs to a keeper session: -ScreenId <id>, else MODO_EQUIPO_SCREEN_ID, else the
 # Claude Code session it was started from. Started from the desktop shortcut (no id at all) every
@@ -39,6 +40,17 @@ if (Test-Path $module) {
     $json = & $module @ensureArgs
     $r = "$json" | ConvertFrom-Json
     if ($Smoke) { "smoke: ensure $json" }
+    # A crashed (offline) driver: offer to restart only that device (Windows may ask for admin
+    # rights), then try once more.
+    if (-not $r.ok -and $r.driverOffline -and -not $Smoke) {
+        $ask = [Windows.Forms.MessageBox]::Show("$($r.error)`n`nRestart the virtual display driver now?", 'Second screen viewer', 'YesNo', 'Warning')
+        if ($ask -eq 'Yes') {
+            $fix = "$(& $module -RestartDriver)" | ConvertFrom-Json
+            if (-not $fix.ok) { Fail "Could not restart the virtual display driver: $($fix.error)`n`n$($r.error)" }
+            $json = & $module @ensureArgs
+            $r = "$json" | ConvertFrom-Json
+        }
+    }
     if ($r.ok) {
         $viewerArgs['Screen'] = $r.screen
         if ($r.id -and -not $r.shared) { $viewerArgs['ScreenId'] = $r.id }

@@ -53,6 +53,8 @@ public static class SvNative {
     [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] public static extern IntPtr GetThreadDpiAwarenessContext();
+    [DllImport("user32.dll")] public static extern int GetAwarenessFromDpiAwarenessContext(IntPtr c);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint p);
     [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint p);
@@ -879,6 +881,8 @@ public class SvInput : NativeWindow {
 # 100% virtual screen) a system-DPI-aware process sees the second screen at the wrong size,
 # so per-monitor awareness is required for the cursor to land where the image shows.
 function Set-PerMonitorDpi {
+    # open-viewer runs the keeper module in this process first, which already makes it per-monitor aware.
+    try { if ([SvNative]::GetAwarenessFromDpiAwarenessContext([SvNative]::GetThreadDpiAwarenessContext()) -eq 2) { return 'per-monitor (already set)' } } catch {}
     try { if ([SvNative]::SetProcessDpiAwarenessContext([IntPtr](-4))) { return 'per-monitor-v2' } } catch {}
     try { if ([SvNative]::SetProcessDpiAwareness(2) -eq 0) { return 'per-monitor' } } catch {}
     try { if ([SvNative]::SetProcessDPIAware()) { return 'system' } } catch {}
@@ -1111,9 +1115,9 @@ function Get-SecondScreen {
     $all | Select-Object -First 1
 }
 
-$screen = Get-SecondScreen
-if (-not $screen -and $script:target) { $script:target = ''; $screen = Get-SecondScreen }   # asked-for screen not there yet
-if (-not $screen) {
+$startScreen = Get-SecondScreen
+if (-not $startScreen -and $script:target) { $script:target = ''; $startScreen = Get-SecondScreen }   # asked-for screen not there yet
+if (-not $startScreen) {
     [Windows.Forms.MessageBox]::Show("No second screen found. Connect a monitor or add a virtual display first.", "Screen viewer") | Out-Null
     exit 1
 }
@@ -1161,6 +1165,7 @@ $script:lastFrameMs = -1000
 
 # --- main window ----------------------------------------------------------------------------
 $form = New-Object SvForm
+$form.NoActivate = [bool]$Smoke   # a smoke run asks Windows not to activate the viewer window
 function Update-Title {
     $s = Get-SecondScreen
     if (-not $s) { return }
@@ -1181,11 +1186,11 @@ $form.Size = New-Object Drawing.Size((Px 640), (Px 380))
 $primary = [Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $form.Location = New-Object Drawing.Point(($primary.Right - $form.Width - (Px 20)), ($primary.Bottom - $form.Height - (Px 20)))
 if ($Smoke) {
-    $sb = $screen.Bounds
+    $sb = $startScreen.Bounds
     if ($SmokeOn) { $on = [Windows.Forms.Screen]::AllScreens | Where-Object { $_.DeviceName -eq $SmokeOn } | Select-Object -First 1; if ($on) { $sb = $on.Bounds } }
     $form.Location = New-Object Drawing.Point(($sb.Right - $form.Width - (Px 40)), ($sb.Bottom - $form.Height - (Px 60)))
 }
-Write-ViewerLog "start dpi=$($script:dpiMode) scale=$k second=$($screen.Bounds)"
+Write-ViewerLog "start dpi=$($script:dpiMode) scale=$k second=$($startScreen.Bounds)"
 
 # Thin strip on top: drag it to move the window; hovering it opens the toolbar.
 $grip = New-Object Windows.Forms.Panel
@@ -1666,8 +1671,8 @@ $form.Add_Shown({
             $script:vis.Add_Tick({
                 $script:visStep++
                 switch ($script:visStep) {
-                    1 { $script:keepBar = $true; Update-Glyphs; $form.WindowState = 'Minimized' }
-                    2 { Write-ViewerLog "smoke pinned+minimized bar visible=$($bar.Visible)"; $form.WindowState = 'Normal' }
+                    1 { $script:keepBar = $true; Update-Glyphs; [SvNative]::ShowWindow($form.Handle, 7) | Out-Null }   # SW_SHOWMINNOACTIVE
+                    2 { Write-ViewerLog "smoke pinned+minimized bar visible=$($bar.Visible)"; [SvNative]::ShowWindow($form.Handle, 4) | Out-Null }   # SW_SHOWNOACTIVATE
                     3 { Write-ViewerLog "smoke restored bar visible=$($bar.Visible)"; $script:vis.Stop() }
                 }
             })

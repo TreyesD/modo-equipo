@@ -4,6 +4,7 @@ param(
     [switch]$Release,
     [switch]$Status,
     [switch]$Keep,
+    [switch]$RestartDriver,
     [string]$ScreenId = '',
     [int[]]$HolderPid = @(),
     [int]$IdleMinutes = 10,
@@ -130,13 +131,19 @@ public sealed class ParsecVdd : IDisposable {
         return new ParsecVdd(h);
     }
 
+    // True once a request never came back (the driver host crashed): every later call fails at
+    // once instead of waiting, so a keeper can always finish and close its handle. An open handle
+    // on a crashed driver keeps Windows from restarting the device.
+    public volatile bool Broken;
+
     // One IOCTL as parsec-vdd.h sends it. Returns the DWORD answer, or -1 on failure.
     int Io(uint code, byte[] payload) {
         lock (ioLock) {
-            if (handle == IntPtr.Zero) return -1;
+            if (handle == IntPtr.Zero || Broken) return -1;
             int ovSize = 2 * IntPtr.Size + 8 + IntPtr.Size;
             IntPtr inBuf = Marshal.AllocHGlobal(32), outBuf = Marshal.AllocHGlobal(4), ov = Marshal.AllocHGlobal(ovSize);
             IntPtr ev = CreateEventW(IntPtr.Zero, true, false, IntPtr.Zero);
+            bool leak = false;
             try {
                 for (int i = 0; i < 32; i++) Marshal.WriteByte(inBuf, i, 0);
                 if (payload != null) Marshal.Copy(payload, 0, inBuf, Math.Min(payload.Length, 32));
@@ -147,13 +154,18 @@ public sealed class ParsecVdd : IDisposable {
                 int n;
                 if (!GetOverlappedResultEx(handle, ov, out n, 5000, false)) {
                     CancelIoEx(handle, ov);
-                    GetOverlappedResult(handle, ov, out n, true); // buffers must outlive the request
+                    // Bounded: a crashed driver may never complete the request, and an unbounded
+                    // wait here once left a keeper hung forever holding the dead device open.
+                    if (!GetOverlappedResultEx(handle, ov, out n, 2000, false)) { leak = true; Broken = true; }
                     return -1;
                 }
                 return Marshal.ReadInt32(outBuf);
             } finally {
-                if (ev != IntPtr.Zero) CloseHandle(ev);
-                Marshal.FreeHGlobal(inBuf); Marshal.FreeHGlobal(outBuf); Marshal.FreeHGlobal(ov);
+                // A request that never finished may still write to its buffers: leave them allocated.
+                if (!leak) {
+                    if (ev != IntPtr.Zero) CloseHandle(ev);
+                    Marshal.FreeHGlobal(inBuf); Marshal.FreeHGlobal(outBuf); Marshal.FreeHGlobal(ov);
+                }
             }
         }
     }
@@ -205,7 +217,7 @@ public sealed class ParsecVdd : IDisposable {
     public void Dispose() {
         int[] mine;
         lock (added) mine = added.ToArray();
-        foreach (int i in mine) RemoveDisplay(i);
+        if (!Broken) foreach (int i in mine) RemoveDisplay(i);
         stopping = true;
         if (pinger != null) pinger.Join(1000);
         lock (ioLock) { if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; } }
@@ -235,6 +247,11 @@ public sealed class ParsecVdd : IDisposable {
 #   parsec-vdd.ps1 -Release                  stops the keeper (removes all its screens).
 #   parsec-vdd.ps1 -Status                   prints the keeper state (sessions, screens) as JSON.
 #   parsec-vdd.ps1 -Keep                     the keeper itself (started hidden by -Ensure).
+#   parsec-vdd.ps1 -RestartDriver            brings a crashed (offline) driver back (asks for admin).
+#
+# -Ensure also repairs what a closed or crashed viewer/keeper can leave: it stops a keeper that
+# has stopped writing its state (hung), drops request files whose holders are gone, and, when the
+# driver is offline, stops keepers that still hold it open and names the restart command.
 #
 # A keeper that dies leaves its sessions' request files and owned.json behind; while another
 # program keeps the displays alive (the ParsecVDisplay app pings every display), the next keeper
@@ -406,6 +423,14 @@ function Test-KeeperIdle([int]$liveCount, [double]$idleSinceMs, [double]$nowMs, 
     return ($liveCount -eq 0 -and ($nowMs - $idleSinceMs) -ge $idleMinutes * 60000)
 }
 
+# A desktop-shortcut viewer session ('viewer-<pid>') is used by nobody but that viewer: when it
+# closes its display becomes a spare at once, so reopening the viewer takes that display again
+# instead of adding another monitor (which flashes every screen). Other sessions keep their
+# screen for IdleMinutes, because tests may still need it.
+function Test-FreeOnClose([string]$id, [int]$listedCount, [int]$liveCount) {
+    return ($id -like 'viewer-*' -and $listedCount -gt 0 -and $liveCount -eq 0)
+}
+
 # Screen id of the caller: -ScreenId, else MODO_EQUIPO_SCREEN_ID, else the Claude Code session
 # it runs in ("cc-" + the first 8 characters of CLAUDE_CODE_SESSION_ID, so every Claude session
 # gets its own screen with no setup), else 'default'.
@@ -504,14 +529,75 @@ function New-EnsureResult([string]$id, [string]$keeper, $screen, [bool]$shared) 
     [pscustomobject]@{ ok = $true; secondScreen = $true; keeper = $keeper; id = $id; screen = $i.name; x = $i.x; y = $i.y; width = $i.width; height = $i.height; shared = $shared }
 }
 
+# Instance ids of the driver's display device(s) (normally ROOT\DISPLAY\0000).
+function Get-DriverInstanceIds {
+    try {
+        @(Get-PnpDevice -Class Display -ErrorAction Stop | Where-Object { $_.InstanceId -like 'ROOT\DISPLAY\*' -and $_.FriendlyName -like '*Parsec*' } | ForEach-Object { $_.InstanceId })
+    } catch { @() }
+}
 # The driver's device exists but its interface is gone: the driver host crashed (Windows event
 # 10111 "offline due to a user-mode driver crash") and stays down until the device is restarted.
 # Told apart from "not installed" so nobody reinstalls or starts other tools for nothing.
-function Test-DriverOffline {
-    try {
-        $d = @(Get-PnpDevice -Class Display -ErrorAction Stop | Where-Object { $_.InstanceId -like 'ROOT\DISPLAY\*' -and $_.FriendlyName -like '*Parsec*' })
-        return ($d.Count -gt 0)
-    } catch { return $false }
+function Test-DriverOffline { return (@(Get-DriverInstanceIds).Count -gt 0) }
+
+function Get-RestartCommand {
+    $ids = @(Get-DriverInstanceIds); if (-not $ids.Count) { $ids = @('ROOT\DISPLAY\0000') }
+    return (($ids | ForEach-Object { "pnputil /restart-device `"$_`"" }) -join '; ')
+}
+
+# Command line of a screen keeper process (any version: '-Keep' runs the keeper loop).
+function Test-KeeperCommandLine([string]$cmd) {
+    return ($cmd -match 'parsec-vdd\.ps1"?\s' -and $cmd -match '\s-Keep(\s|$)')
+}
+function Get-KeeperProcesses {
+    @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessId -ne $PID -and (Test-KeeperCommandLine "$($_.CommandLine)") })
+}
+
+# A keeper rewrites keeper.json every second. One that holds its mutex but has not written for
+# $limitSeconds is hung (seen: a keeper stuck for hours on a crashed driver). A keeper that is
+# just starting has no state yet and is never called hung.
+function Test-KeeperHung($state, [datetime]$now, [int]$limitSeconds) {
+    if (-not $state -or -not $state.updated) { return $false }
+    $at = [datetime]::MinValue
+    if (-not [datetime]::TryParse("$($state.updated)", [ref]$at)) { return $false }
+    return (($now - $at).TotalSeconds -ge $limitSeconds)
+}
+
+# Session requests a keeper that is gone left behind. A request whose holders are all gone and
+# that nobody touched for IdleMinutes would only make the next keeper add a display that nobody
+# uses (and flash the screens), so it is dropped. The keeper rewrites a request file whenever
+# its holders change, so the file age is how long it has had no holder. $requests: id, pids,
+# ageMinutes. Returns the ids to drop; $keepId (the caller's own id) is never dropped.
+function Select-StaleRequests($requests, [scriptblock]$IsAlive, [double]$idleMinutes, [string]$keepId) {
+    @($requests | Where-Object {
+        $_.id -ne $keepId -and @(Get-LiveHolders @($_.pids) $IsAlive).Count -eq 0 -and $_.ageMinutes -ge $idleMinutes
+    } | ForEach-Object { $_.id })
+}
+
+# Called when no keeper runs: removes what a keeper that died left behind, so the next one
+# starts clean. owned.json stays (the next keeper uses it to take over displays still alive).
+function Clear-StaleKeeperState([string]$keepId, [double]$idleMinutes) {
+    $done = @()
+    $sf = Join-Path $script:KeeperDir 'keeper.json'
+    if (Test-Path $sf) { Remove-Item $sf -ErrorAction SilentlyContinue; $done += 'old keeper.json' }
+    if (Test-Path $script:SessionDir) {
+        Get-ChildItem -Path $script:SessionDir -Filter '*.release' -ErrorAction SilentlyContinue | Remove-Item -ErrorAction SilentlyContinue
+        $req = @(Get-ChildItem -Path $script:SessionDir -Filter '*.txt' -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{ id = $_.BaseName.ToLowerInvariant(); pids = @(Read-PidFile $_.FullName); ageMinutes = ((Get-Date) - $_.LastWriteTime).TotalMinutes }
+        })
+        foreach ($sid in (Select-StaleRequests $req $script:IsAlive $idleMinutes $keepId)) {
+            Remove-Item (Join-Path $script:SessionDir "$sid.txt") -ErrorAction SilentlyContinue
+            $done += "stale request '$sid'"
+        }
+    }
+    return $done
+}
+
+function Stop-KeeperProcess([int]$keeperPid) {
+    try { Stop-Process -Id $keeperPid -Force -ErrorAction Stop } catch {}
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Process -Id $keeperPid -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
 }
 
 function Invoke-Ensure([string]$id, [int[]]$holders, [int]$idleMinutes, [int]$timeoutSeconds) {
@@ -519,17 +605,38 @@ function Invoke-Ensure([string]$id, [int[]]$holders, [int]$idleMinutes, [int]$ti
     $second = @($screens | Where-Object { -not $_.Primary })
     $virtual = @($second | Where-Object { $_.Virtual })
     $running = Test-KeeperRunning
+    $repaired = @()
+    # A hung keeper holds its mutex forever, so every -Ensure would wait and fail: stop it.
+    if ($running) {
+        $st = Read-KeeperState
+        if ((Test-KeeperHung $st (Get-Date) 90) -and $st.pid) {
+            $p = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$st.pid)" -ErrorAction SilentlyContinue
+            if ($p -and (Test-KeeperCommandLine "$($p.CommandLine)")) {
+                Stop-KeeperProcess ([int]$st.pid)
+                $repaired += "stopped hung keeper pid $($st.pid)"
+                $running = Test-KeeperRunning
+            }
+        }
+    }
+    if (-not $running) { $repaired += @(Clear-StaleKeeperState $id $idleMinutes) }
     # 'default' with a real second monitor and no virtual one: nothing to keep and nothing to lock.
     if ($id -eq 'default' -and $second.Count -gt 0 -and $virtual.Count -eq 0 -and -not $running) {
         return New-EnsureResult $id 'not-needed' $second[0] $false
     }
-    if (-not $running -and -not [ModoEquipo.ParsecVdd]::FindDevicePath()) {
-        if ($second.Count) { return New-EnsureResult $id 'no-driver' $second[0] $true }   # every session shares it
-        if (Test-DriverOffline) {
-            return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = 'none'; id = $id; driverOffline = $true
-                error = 'The Parsec Virtual Display Driver is installed but offline (its driver host crashed). Restart it: run "pnputil /restart-device ROOT\DISPLAY\0000" in an administrator terminal, or reboot. Nothing else to clean up.' }
+    if (-not [ModoEquipo.ParsecVdd]::FindDevicePath()) {
+        $offline = Test-DriverOffline
+        if ($offline) {
+            # Keepers still running hold the crashed driver open, which keeps Windows from
+            # restarting it, and cannot add displays anyway: stop them (their displays are gone).
+            foreach ($k in (Get-KeeperProcesses)) { Stop-KeeperProcess ([int]$k.ProcessId); $repaired += "stopped keeper pid $($k.ProcessId) holding the offline driver" }
+            if ($repaired.Count) { Clear-StaleKeeperState $id $idleMinutes | Out-Null }
         }
-        return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = 'none'; id = $id; error = 'Parsec Virtual Display Driver not installed (see references/second-screen.md, option B).' }
+        if ($second.Count) { $r = New-EnsureResult $id 'no-driver' $second[0] $true; if ($offline) { $r | Add-Member driverOffline $true }; return $r }   # every session shares it
+        if ($offline) {
+            return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = 'none'; id = $id; driverOffline = $true; repaired = $repaired
+                error = "The Parsec Virtual Display Driver is installed but offline (its driver host crashed, usually after many monitors were added and removed quickly). Restart that device: run  $(Get-RestartCommand)  in an administrator terminal (or parsec-vdd.ps1 -RestartDriver), or reboot. Do not reinstall it." }
+        }
+        if (-not $running) { return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = 'none'; id = $id; error = 'Parsec Virtual Display Driver not installed (see references/second-screen.md, option B).' } }
     }
     $request = Join-Path $script:SessionDir "$id.txt"
     Remove-Item (Join-Path $script:SessionDir "$id.release") -ErrorAction SilentlyContinue
@@ -549,7 +656,7 @@ function Invoke-Ensure([string]$id, [int[]]$holders, [int]$idleMinutes, [int]$ti
             $s = @($state.sessions | Where-Object { $_.id -eq $id })
             if ($s.Count) {
                 $scr = @(Get-ScreenList | Where-Object { $_.Name -eq $s[0].device })
-                if ($scr.Count) { return New-EnsureResult $id $how $scr[0] $false }
+                if ($scr.Count) { $ok = New-EnsureResult $id $how $scr[0] $false; if ($repaired.Count) { $ok | Add-Member repaired $repaired }; return $ok }
             }
             $e = @($state.errors | Where-Object { $_.id -eq $id -and [datetime]$_.at -ge $since.AddSeconds(-2) })
             if ($e.Count) { return [pscustomobject]@{ ok = $false; secondScreen = $false; keeper = $how; id = $id; error = $e[0].error } }
@@ -657,6 +764,13 @@ function Invoke-Keeper([int]$idleMinutes, [int]$SpareMinutes = 720) {
         $lock.Start()
         while (-not $stop.WaitOne(1000)) {
             $now = $clock.ElapsedMilliseconds
+            # A request that never came back means the driver host crashed: close the handle at once
+            # (an open handle keeps Windows from restarting the device); the next add reopens it.
+            if ($script:vddRef -and $script:vddRef.Broken) {
+                KLog 'driver stopped answering (crashed?): closed its handle'
+                try { $script:vddRef.Dispose() } catch {}
+                $script:vddRef = $null
+            }
             $screens = Get-ScreenList
             $names = @($screens | ForEach-Object { $_.Name })
             $orphans = @($orphans | Where-Object { $names -contains $_.device })
@@ -712,7 +826,8 @@ function Invoke-Keeper([int]$idleMinutes, [int]$SpareMinutes = 720) {
                     $live = Get-LiveHolders $listed $script:IsAlive
                     if ($live.Count -ne $listed.Count) { Write-PidFile $file $live }
                     $s.Holders = $live
-                    if ($live.Count) { $s.IdleSince = $now }
+                    if (Test-FreeOnClose $id $listed.Count $live.Count) { $why = 'viewer closed' }
+                    elseif ($live.Count) { $s.IdleSince = $now }
                     elseif (Test-KeeperIdle 0 $s.IdleSince $now $idleMinutes) { $why = "no holder for $idleMinutes min" }
                 }
                 if ($why) {
@@ -794,6 +909,26 @@ if ($Release) {
     Invoke-Release $rid | ConvertTo-Json -Compress; exit 0
 }
 if ($Status) { Get-KeeperStatus | ConvertTo-Json -Depth 5 -Compress; exit 0 }
+# -RestartDriver: restarts only the driver's own display device (pnputil /restart-device), which
+# brings a crashed driver back. Needs administrator rights, so Windows may ask (UAC). It first
+# stops keepers that still hold the crashed driver open. Never reinstalls anything.
+if ($RestartDriver) {
+    $ids = @(Get-DriverInstanceIds)
+    if (-not $ids.Count) { [pscustomobject]@{ ok = $false; error = 'Parsec Virtual Display Driver not installed.' } | ConvertTo-Json -Compress; exit 1 }
+    if ([ModoEquipo.ParsecVdd]::FindDevicePath()) { [pscustomobject]@{ ok = $true; restarted = $false; note = 'driver already online' } | ConvertTo-Json -Compress; exit 0 }
+    foreach ($k in (Get-KeeperProcesses)) { Stop-KeeperProcess ([int]$k.ProcessId) }
+    $cmd = (($ids | ForEach-Object { "pnputil /restart-device '$_' | Out-Null; if (`$LASTEXITCODE) { `$bad = `$LASTEXITCODE }" }) -join '; ') + '; exit [int]$bad'
+    $ps = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    try {
+        $p = Start-Process -FilePath $ps -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList @('-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', $cmd) -ErrorAction Stop
+        $code = $p.ExitCode
+    } catch { [pscustomobject]@{ ok = $false; error = "Administrator rights were not granted: $($_.Exception.Message)" } | ConvertTo-Json -Compress; exit 1 }
+    $deadline = (Get-Date).AddSeconds(15)
+    while (-not [ModoEquipo.ParsecVdd]::FindDevicePath() -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+    $online = [bool][ModoEquipo.ParsecVdd]::FindDevicePath()
+    [pscustomobject]@{ ok = $online; restarted = $true; pnputilExit = $code; devices = $ids; error = $(if ($online) { $null } else { 'The device was restarted but the driver is still offline: reboot.' }) } | ConvertTo-Json -Compress
+    exit $(if ($online) { 0 } else { 1 })
+}
 if ($Keep) { Invoke-Keeper $IdleMinutes $SpareMinutes; exit 0 }
 
 if ($SelfTest) {
@@ -852,6 +987,25 @@ if ($SelfTest) {
     $hr = Get-HomeRect @((Scr 0 0 1920 1080 $false), (Scr 1920 0 1920 1080 $true), (Scr 3840 0 1920 1080 $true), (Scr 5760 0 1920 1080 $true))
     Check 'lock area: main + three virtual -> main' ($hr -and $hr.X -eq 0 -and $hr.Width -eq 1920)
     Check 'display limit follows parsec-vdd.h' ($script:MaxDisplays -eq 8)
+    # Close + reopen: what a keeper that died or hung leaves behind.
+    $alive = { param($p) $p -eq 10 }
+    $req = @(
+        [pscustomobject]@{ id = 'viewer-1'; pids = @(99); ageMinutes = 30 },   # viewer closed long ago
+        [pscustomobject]@{ id = 'viewer-2'; pids = @(10); ageMinutes = 30 },   # viewer still open
+        [pscustomobject]@{ id = 'qa'; pids = @(); ageMinutes = 3 },            # holder-less, still in its idle time
+        [pscustomobject]@{ id = 'me'; pids = @(98); ageMinutes = 60 })         # the caller itself
+    Check 'stale holders: only dead, idle requests are dropped, never the caller' ((@(Select-StaleRequests $req $alive 10 'me') -join ',') -eq 'viewer-1')
+    $now = [datetime]'2026-11-18T04:00:00'
+    Check 'hung keeper: state not written for 90 s' (Test-KeeperHung ([pscustomobject]@{ updated = '2026-11-18T03:58:00' }) $now 90)
+    Check 'hung keeper: a keeper writing every second is not hung' (-not (Test-KeeperHung ([pscustomobject]@{ updated = '2026-11-18T03:59:59' }) $now 90))
+    Check 'hung keeper: a keeper with no state yet is not hung' (-not (Test-KeeperHung $null $now 90))
+    Check 'keeper process: -Keep command line is recognised' (Test-KeeperCommandLine '"powershell.exe" -NoProfile -File "C:\x\viewer\parsec-vdd.ps1" -Keep -IdleMinutes 10')
+    Check 'keeper process: -Ensure and other scripts are not' (-not (Test-KeeperCommandLine '"powershell.exe" -File "C:\x\parsec-vdd.ps1" -Ensure -HolderPid 4') -and -not (Test-KeeperCommandLine 'powershell -File other.ps1 -Keep'))
+    Check 'reopen: a closed shortcut viewer frees its display at once' (Test-FreeOnClose 'viewer-123' 1 0)
+    Check 'reopen: an open viewer keeps it' (-not (Test-FreeOnClose 'viewer-123' 1 1))
+    Check 'reopen: other sessions keep their screen for the idle time' (-not (Test-FreeOnClose 'cc-99a1426c' 1 0) -and -not (Test-FreeOnClose 'viewer-1' 0 0))
+    Check 'driver calls never wait forever (Broken flag)' ([bool]($T.GetField('Broken')))
+    Check 'restart command names the device' ((Get-RestartCommand) -match '^pnputil /restart-device "ROOT\\DISPLAY\\')
     $d = [ModoEquipo.CursorLock]::Desktop()
     Check 'desktop rectangle is readable' (($d.Right - $d.Left) -gt 0 -and ($d.Bottom - $d.Top) -gt 0)
     # Driver state is informational: a machine without the driver still passes.

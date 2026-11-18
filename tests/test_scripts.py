@@ -10,6 +10,7 @@ import json
 import os
 import re
 import socket
+import shutil
 import struct
 import subprocess
 import sys
@@ -522,6 +523,61 @@ class ParsecVirtualDisplay(unittest.TestCase):
                 text = f.read()
             self.assertIn("Ensure = $true", text, name)     # launchers ask the keeper for a screen
             self.assertIn("['ScreenId'] = $ScreenId", text, name)   # for their own session id
+
+    def test_reopen_path_repairs_stale_keeper_state(self):
+        # Reopening after a close or a crash: a hung keeper, request files of closed viewers and a
+        # keeper holding a crashed driver open must not block the next -Ensure.
+        with open(os.path.join(self.DIR, "parsec-vdd.ps1"), encoding="utf-8") as f:
+            text = f.read()
+        ensure = text[text.index("function Invoke-Ensure"):text.index("# -Release -ScreenId")]
+        self.assertIn("Test-KeeperHung $st", ensure)            # hung keeper is stopped
+        self.assertIn("Clear-StaleKeeperState $id", ensure)     # stale requests and keeper.json
+        self.assertIn("Get-KeeperProcesses", ensure)            # keepers holding the offline driver
+        self.assertIn("driverOffline = $true", ensure)
+        self.assertIn("Get-RestartCommand", ensure)             # error names the exact command
+        # The driver wrapper never waits without a bound (that hung a keeper for hours).
+        self.assertNotIn("GetOverlappedResult(handle, ov, out n, true)", text)
+        self.assertIn("public volatile bool Broken", text)
+        with open(os.path.join(self.DIR, "open-viewer.ps1"), encoding="utf-8") as f:
+            viewer = f.read()
+        self.assertIn("-RestartDriver", viewer)                 # offline driver: offer the restart
+        self.assertNotIn("ParsecVDisplay.exe", viewer)
+        with open(os.path.join(self.DIR, "screen-viewer.ps1"), encoding="utf-8") as f:
+            sv = f.read()
+        # PowerShell names are case-insensitive: "$screen = <Screen>" would turn the screen into
+        # the [string] -Screen parameter (seen: smoke window placed off every screen on reopen).
+        self.assertIsNone(re.search(r"(?mi)^\s*\$screen\s*=", sv))
+        self.assertIn("$form.NoActivate = [bool]$Smoke", sv)   # a smoke run asks not to be activated
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows PowerShell only")
+    def test_stale_holder_state_is_cleared_before_a_keeper_starts(self):
+        # Runs Clear-StaleKeeperState against a throwaway keeper folder (MODO_EQUIPO_KEEPER_TAG):
+        # no keeper is started and no display is added.
+        tag = "t%d" % os.getpid()
+        kdir = os.path.join(os.environ["USERPROFILE"], ".claude", "modo-equipo", "screen-keeper-v2-" + tag)
+        self.addCleanup(shutil.rmtree, kdir, True)
+        script = os.path.join(self.DIR, "parsec-vdd.ps1")
+        expr = (
+            "$env:MODO_EQUIPO_KEEPER_TAG = '%s'; . '%s'; "
+            "New-Item -ItemType Directory -Force $script:SessionDir | Out-Null; "
+            "Set-Content (Join-Path $script:KeeperDir 'keeper.json') '{\"sessions\":[{\"id\":\"old\"}]}'; "
+            "Set-Content (Join-Path $script:SessionDir 'old.txt') '999999'; "
+            "(Get-Item (Join-Path $script:SessionDir 'old.txt')).LastWriteTime = (Get-Date).AddHours(-1); "
+            "Set-Content (Join-Path $script:SessionDir 'live.txt') $PID; "
+            "(Get-Item (Join-Path $script:SessionDir 'live.txt')).LastWriteTime = (Get-Date).AddHours(-1); "
+            "Set-Content (Join-Path $script:SessionDir 'me.txt') '999998'; "
+            "(Get-Item (Join-Path $script:SessionDir 'me.txt')).LastWriteTime = (Get-Date).AddHours(-1); "
+            "Set-Content (Join-Path $script:SessionDir 'old.release') '1'; "
+            "$done = Clear-StaleKeeperState 'me' 10; "
+            "$left = (Get-ChildItem $script:SessionDir | ForEach-Object Name | Sort-Object) -join ','; "
+            "'{0}|{1}|{2}' -f $left, (Test-Path (Join-Path $script:KeeperDir 'keeper.json')), ($done -join ';')"
+        ) % (tag, script)
+        out = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", expr],
+                             capture_output=True, text=True, timeout=120)
+        left, state, done = out.stdout.strip().splitlines()[-1].split("|")
+        self.assertEqual(left, "live.txt,me.txt", out.stdout + out.stderr)   # closed viewer dropped
+        self.assertEqual(state, "False")                                      # stale keeper.json gone
+        self.assertIn("stale request 'old'", done)
 
     @unittest.skipUnless(sys.platform == "win32", "Windows PowerShell only")
     def test_self_test_checks_ioctls_without_adding_a_display(self):
