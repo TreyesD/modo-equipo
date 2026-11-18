@@ -147,7 +147,11 @@ Guard 'session release'
 $rel = Keeper @('-Release', '-ScreenId', $ids[2])
 Start-Sleep 2
 $still = @(Get-ScreenList | ForEach-Object { $_.Name })
-Check ([bool]($rel.ok -and $still -notcontains $answers[$ids[2]].screen)) "release: '$($ids[2])' freed, its screen $($answers[$ids[2]].screen) is gone"
+$stR = Keeper @('-Status')
+Check ([bool]($rel.ok -and -not @($stR.sessions | Where-Object { $_.id -eq $ids[2] }).Count)) "release: session '$($ids[2])' freed"
+Check ($still -contains $answers[$ids[2]].screen) "release: its screen $($answers[$ids[2]].screen) is kept as a spare (no monitor removed, no flash)"
+$spare = Keeper @('-Ensure', '-ScreenId', 'stress-spare', '-IdleMinutes', '1')
+Check ([bool]($spare -and $spare.screen -eq $answers[$ids[2]].screen)) "release: a new session takes over the spare screen ($($spare.screen)) instead of adding a monitor"
 Check (-not @($ids | Where-Object { $_ -ne $ids[2] } | Where-Object { $still -notcontains $answers[$_].screen }).Count) "release: the other sessions kept their screens"
 $nowList = Get-ScreenList
 $moved = @(foreach ($id in ($ids | Where-Object { $_ -ne $ids[2] })) {
@@ -166,7 +170,7 @@ Guard 'idle expiry'
 $deadline = (Get-Date).AddSeconds(100); $freed = $false
 do { Start-Sleep 5; $st = Keeper @('-Status'); $freed = -not @($st.sessions | Where-Object { $_.id -eq $dead }).Count } while (-not $freed -and (Get-Date) -lt $deadline)
 Check $freed "idle: the session of the dead holder was freed"
-Check (@(Get-ScreenList | ForEach-Object { $_.Name }) -notcontains $answers[$dead].screen) "idle: its screen was removed"
+Check (@(Get-ScreenList | ForEach-Object { $_.Name }) -contains $answers[$dead].screen) "idle: its screen was kept as a spare, not removed"
 
 # --- D. keeper killed and restarted ----------------------------------------------------------
 Guard 'keeper kill'
@@ -188,7 +192,7 @@ Start-Sleep 20   # unclaimed displays of the dead keeper go after 15 s
 $st = Keeper @('-Status')
 $extra = @(Get-ScreenList | Where-Object { $_.Virtual } | ForEach-Object { $_.Name } | Where-Object { $script:baseVirtual -notcontains $_ })
 Note "restart: sessions now $(($st.sessions | ForEach-Object { "$($_.id)=$($_.device)" }) -join ' '); test displays $($extra -join ' ')"
-Check ($extra.Count -le @($st.sessions).Count) "restart: no display left over beyond the live sessions"
+Check ($extra.Count -le $survived.Count) "restart: no display added beyond the ones that survived the kill ($($extra.Count) now, $($survived.Count) survived)"
 Baseline-Intact 'after the keeper restart'
 
 # --- E. release everything ---------------------------------------------------------------------

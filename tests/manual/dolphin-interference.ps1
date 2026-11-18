@@ -156,16 +156,22 @@ $t0 = Get-Date
 Start-Sleep 5
 
 # --- other sessions' screens come and go ---------------------------------------------------
-for ($c = 1; $c -le $Cycles; $c++) {
-    $b = Keeper @('-Ensure', '-ScreenId', 'other-b', '-IdleMinutes', '1')
-    $cc = Keeper @('-Ensure', '-ScreenId', 'other-c', '-IdleMinutes', '1')
-    Note "cycle $c : added B=$($b.screen) at $($b.x),$($b.y) C=$($cc.screen) at $($cc.x),$($cc.y)"
-    Start-Sleep 3
-    $null = Keeper @('-Release', '-ScreenId', 'other-b')
-    $null = Keeper @('-Release', '-ScreenId', 'other-c')
-    Note "cycle $c : removed B and C"
-    Start-Sleep 3
-}
+# Real topology changes next to Dolphin's screen: extra displays are added and removed straight
+# through the driver (the keeper itself keeps freed displays as spares, so it would not remove).
+$vddB = [ModoEquipo.ParsecVdd]::Open()
+try {
+    for ($c = 1; $c -le $Cycles; $c++) {
+        $before = @(Get-ScreenList | ForEach-Object { $_.Name })
+        $ib = $vddB.AddDisplay(); $nb = Wait-NewScreen $before 10000
+        $before2 = @(Get-ScreenList | ForEach-Object { $_.Name })
+        $ic = $vddB.AddDisplay(); $nc = Wait-NewScreen $before2 10000
+        Note "cycle $c : added B=$($nb.Name) at $($nb.Bounds.X),$($nb.Bounds.Y) C=$($nc.Name) at $($nc.Bounds.X),$($nc.Bounds.Y) (adds took $($vddB.LastAddAttempts) try)"
+        Start-Sleep 3
+        $vddB.RemoveDisplay($ib); $vddB.RemoveDisplay($ic)
+        Note "cycle $c : removed B and C"
+        Start-Sleep 3
+    }
+} finally { $vddB.Dispose() }
 Start-Sleep 5
 Set-Content $stopFile '1'
 Receive-Job -Job $sampler -Wait -AutoRemoveJob | Out-Null
