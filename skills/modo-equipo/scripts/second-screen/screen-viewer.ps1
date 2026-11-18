@@ -51,6 +51,16 @@ public static class SvNative {
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint p);
     [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint p);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int hh, uint flags);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr h, int index);
+    // Always on top applies to the small window only: never in full screen (Alt+Tab and Win+Tab
+    // must switch away normally), whatever the "always on top" toggle says.
+    public static bool WantTopMost(bool fullScreen, bool onTopToggle) { return onTopToggle && !fullScreen; }
+    public static bool IsTopMost(IntPtr h) { return (GetWindowLong(h, -20) & 0x8) != 0; }   // WS_EX_TOPMOST
+    // Sets or clears the topmost state through the window manager (SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE).
+    public static void SetTopMost(IntPtr h, bool on) {
+        SetWindowPos(h, on ? new IntPtr(-1) : new IntPtr(-2), 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010);
+    }
 }
 
 // Borderless window that can still be resized from its edges and moved from any control.
@@ -110,6 +120,7 @@ public class SvBar : Form {
     public Color Accent = Color.FromArgb(96, 170, 255);
     public string DragTip = "";
     public event EventHandler<SvBarClickEventArgs> ButtonClick;
+    public event EventHandler WindowDrag;   // pressed the pill outside its buttons: move the viewer window
 
     readonly float k;
     readonly Font glyphFont;
@@ -269,11 +280,23 @@ public class SvBar : Form {
         if (changed) Render();
     }
 
+    // What a left press does: "slide" (the dotted grip slides the bar along the edge), "button",
+    // "window" (the rest of the pill drags the viewer window, so the bar never blocks moving it)
+    // or "none" (outside the pill: the transparent margin).
+    public static string PressAction(float openness, int hover, bool inPill) {
+        if (openness >= 1f) {
+            if (hover == -2) return "slide";
+            if (hover >= 0) return "button";
+        }
+        return inPill ? "window" : "none";
+    }
     protected override void OnMouseDown(MouseEventArgs e) {
         base.OnMouseDown(e);
-        if (e.Button != MouseButtons.Left || t < 1f) return;
-        if (hover == -2) { dragging = true; dragX = Cursor.Position.X; dragOffset = Offset; Capture = true; }
-        else if (hover >= 0) { pressed = hover; Render(); }
+        if (e.Button != MouseButtons.Left) return;
+        string act = PressAction(t, hover, PillBounds.Contains(Cursor.Position));
+        if (act == "slide") { dragging = true; dragX = Cursor.Position.X; dragOffset = Offset; Capture = true; }
+        else if (act == "button") { pressed = hover; Render(); }
+        else if (act == "window") { EventHandler h = WindowDrag; if (h != null) h(this, EventArgs.Empty); }
     }
     protected override void OnMouseMove(MouseEventArgs e) {
         base.OnMouseMove(e);
@@ -939,6 +962,28 @@ if ($SelfTest) {
     $left = [SvDrive]::Advance([ref]$x, [ref]$y, 5, 0, 0.5, $sb, $true, [ref]$ox, [ref]$oy)
     Check (-not $left -and $x -eq 3839) "drive clamps while a button is held got=$x"
     Check (-not [SvAutoMute]::On) "auto mute starts off"
+    # Always on top: small window only.
+    Check ([SvNative]::WantTopMost($false, $true)) "small window follows the always-on-top toggle (on)"
+    Check (-not [SvNative]::WantTopMost($false, $false)) "small window follows the always-on-top toggle (off)"
+    Check (-not [SvNative]::WantTopMost($true, $true)) "full screen is never topmost, even with the toggle on"
+    Check (-not [SvNative]::WantTopMost($true, $false)) "full screen is not topmost with the toggle off"
+    # The window manager really clears and sets the topmost state (invisible test window).
+    $tw = New-Object Windows.Forms.Form
+    $tw.FormBorderStyle = 'None'; $tw.ShowInTaskbar = $false; $tw.StartPosition = 'Manual'; $tw.Opacity = 0
+    $tw.Location = New-Object Drawing.Point(-30000, -30000); $tw.Size = New-Object Drawing.Size(10, 10)
+    $tw.Show()
+    [SvNative]::SetTopMost($tw.Handle, $true)
+    Check ([SvNative]::IsTopMost($tw.Handle)) "SetTopMost(true) makes a window topmost"
+    [SvNative]::SetTopMost($tw.Handle, $false)
+    Check (-not [SvNative]::IsTopMost($tw.Handle)) "SetTopMost(false) clears it (full screen)"
+    $tw.Close(); $tw.Dispose()
+    # Toolbar presses: the pill outside its buttons drags the window; the dotted grip slides the bar.
+    Check ([SvBar]::PressAction(1.0, 2, $true) -eq 'button') "press on a button clicks it"
+    Check ([SvBar]::PressAction(1.0, -2, $true) -eq 'slide') "press on the dotted grip slides the bar"
+    Check ([SvBar]::PressAction(1.0, -1, $true) -eq 'window') "press on the open pill's background drags the window"
+    Check ([SvBar]::PressAction(0.0, -1, $true) -eq 'window') "press on the resting handle drags the window"
+    Check ([SvBar]::PressAction(0.5, 1, $true) -eq 'window') "press while the bar is still opening drags the window"
+    Check ([SvBar]::PressAction(1.0, -1, $false) -eq 'none') "press on the transparent margin does nothing"
     # Toolbar visibility: it follows the viewer, and the pin (keep open) never keeps it on screen.
     Check ([SvBar]::ShouldShow($false, $true, $false)) "bar shown with the viewer"
     Check ([SvBar]::ShouldShow($false, $true, $true)) "bar shown with the viewer, pinned"
@@ -1068,10 +1113,12 @@ $btnFull    = New-BarButton 'full' $true
 $btnKeep    = New-BarButton 'keep'
 $btnMin     = New-BarButton 'min' $true
 $btnClose   = New-BarButton 'close' $false $true
+# Pressing the toolbar outside its buttons moves the window (not in full screen).
+$bar.Add_WindowDrag({ if (-not $script:full) { [SvForm]::DragMove($form) } })
 $bar.Add_ButtonClick({
     param($sender, $e)
     switch ($e.Id) {
-        'pin'     { $script:onTop = -not $script:onTop; $form.TopMost = $script:onTop; Update-Glyphs }
+        'pin'     { $script:onTop = -not $script:onTop; Apply-TopMost; Update-Glyphs }
         'pointer' { Switch-Pointer }
         'mute'    { Switch-Mute }
         'lock'    { Switch-Lock }
@@ -1081,6 +1128,15 @@ $bar.Add_ButtonClick({
         'close'   { $form.Close() }
     }
 })
+
+# The window and its toolbar are topmost only for the small window with the toggle on; the
+# window manager is told directly, so full screen can never stay above other apps.
+function Apply-TopMost {
+    $want = [SvNative]::WantTopMost($script:full, $script:onTop)
+    $form.TopMost = $want
+    if ($form.IsHandleCreated -and ([SvNative]::IsTopMost($form.Handle) -ne $want)) { [SvNative]::SetTopMost($form.Handle, $want) }
+    if ($bar.IsHandleCreated -and ([SvNative]::IsTopMost($bar.Handle) -ne $want)) { [SvNative]::SetTopMost($bar.Handle, $want) }
+}
 
 function Update-ToolbarSize {
     $btnPin.Visible = -not $script:full   # "always on top" only exists for the small window
@@ -1143,7 +1199,7 @@ function Set-Fullscreen([bool]$on) {
         $form.Resizable = $false
         $grip.Visible = $false
         $form.Padding = New-Object Windows.Forms.Padding(0)
-        $form.TopMost = $false
+        Apply-TopMost
         $form.Bounds = $sb
     } else {
         $script:full = $false
@@ -1151,8 +1207,8 @@ function Set-Fullscreen([bool]$on) {
         $grip.Visible = $true
         $form.Padding = New-Object Windows.Forms.Padding($form.Grip)
         $form.Bounds = $script:normalBounds
-        $form.TopMost = $script:onTop
     }
+    Apply-TopMost
     Write-ViewerLog "fullscreen=$on"
     Update-ToolbarSize
     Update-Glyphs
@@ -1353,6 +1409,7 @@ $timer.Interval = 16
 $timer.Add_Tick({
     # The toolbar follows the viewer: SvBar hides itself while the viewer is minimized or hidden
     # (pinned or not); it comes back here once the viewer is shown again.
+    if ($script:full -and ([SvNative]::IsTopMost($form.Handle) -or ($bar.IsHandleCreated -and [SvNative]::IsTopMost($bar.Handle)))) { Apply-TopMost }
     if (-not $bar.Visible -and [SvBar]::OwnerShown($form, $script:keepBar)) {
         Update-ToolbarPlacement
         $bar.Show($form)
