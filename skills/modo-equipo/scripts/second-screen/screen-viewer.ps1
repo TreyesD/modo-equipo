@@ -116,7 +116,12 @@ public class SvBar : Form {
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
     [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(SvPt p);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint flags);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLongX(IntPtr h, int i);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW")] static extern int SetWindowLongX(IntPtr h, int i, int v);
 
+    public Point? Probe;                // tests only: use this point instead of the real cursor
     public readonly List<SvBarButton> Buttons = new List<SvBarButton>();
     public Rectangle DockRect;          // the bar is centred on the top edge of this rectangle
     public Rectangle Limit;           // and kept inside this one (the screen)
@@ -239,6 +244,35 @@ public class SvBar : Form {
     public static bool OwnerShown(Form o, bool keepOpen) {
         return o != null && o.IsHandleCreated && ShouldShow(IsIconic(o.Handle), IsWindowVisible(o.Handle), keepOpen);
     }
+    // The bar only reacts to the pointer on the viewer window itself: the strip that wakes the
+    // handle lies inside the viewer's own area (never above it or beside it, so the top edge of
+    // the screen, Chrome's tabs included, is never touched), and the open pill is only kept awake
+    // while the pointer is inside the viewer too.
+    public static bool NearBar(Point c, Rectangle pill, Rectangle dock, float openness, float scale) {
+        int a = (int)Math.Round(10 * scale), b = (int)Math.Round(18 * scale), w = (int)Math.Round(36 * scale), h = (int)Math.Round(12 * scale);
+        Rectangle zone = openness > 0.05f ? Rectangle.Inflate(pill, a, a)
+                                          : new Rectangle(pill.X - b, dock.Top, pill.Width + w, h);
+        zone.Intersect(dock);
+        return zone.Contains(c);
+    }
+    // True when the pointer is over the pill (which then takes the mouse); everywhere else the bar
+    // is click-through, so it can never take a click or hold the cursor on the main screen.
+    public static bool TakesMouse(Point c, Rectangle pill, bool dragging) { return dragging || pill.Contains(c); }
+    // Whether the window under the pointer is the viewer or its bar (not another app covering it).
+    bool OverViewer(Point c) {
+        Form o = Owner;
+        if (o == null || !o.IsHandleCreated) return true;
+        SvPt pt; pt.X = c.X; pt.Y = c.Y;
+        IntPtr root = GetAncestor(WindowFromPoint(pt), 2);   // GA_ROOT
+        return root == IntPtr.Zero || root == o.Handle || root == Handle;
+    }
+    public bool ClickThrough { get { return (GetWindowLongX(Handle, -20) & 0x20) != 0; } }   // WS_EX_TRANSPARENT
+    void SetClickThrough(bool on) {
+        int ex = GetWindowLongX(Handle, -20);
+        int want = on ? (ex | 0x20) : (ex & ~0x20);
+        if (want != ex) SetWindowLongX(Handle, -20, want);
+    }
+    public void StepNow() { Step(); }
     void Step() {
         if (!Visible) return;
         // Win32 state of the viewer window, so every way of minimizing it counts (its own button,
@@ -250,11 +284,10 @@ public class SvBar : Form {
             return;
         }
         long now = clock.ElapsedMilliseconds;
-        Point c = Cursor.Position;
+        Point c = Probe.HasValue ? Probe.Value : Cursor.Position;
         Rectangle pill = PillBounds;
-        Rectangle zone = t > 0.05f ? Rectangle.Inflate(pill, S(10), S(10))
-                                   : new Rectangle(pill.X - S(18), DockRect.Top, pill.Width + S(36), S(12));
-        if (zone.Contains(c)) lastNear = now;
+        SetClickThrough(!TakesMouse(c, pill, dragging));
+        if (NearBar(c, pill, DockRect, t, k) && (Probe.HasValue || OverViewer(c))) lastNear = now;
         bool open = KeepOpen || ForceOpen || dragging || (now - lastNear) < 600;
         if (open != wantOpen) wantOpen = open;
         float target = wantOpen ? 1f : 0f;
@@ -1001,6 +1034,40 @@ if ($SelfTest) {
     Check ([SvBar]::PressAction(0.0, -1, $true) -eq 'window') "press on the resting handle drags the window"
     Check ([SvBar]::PressAction(0.5, 1, $true) -eq 'window') "press while the bar is still opening drags the window"
     Check ([SvBar]::PressAction(1.0, -1, $false) -eq 'none') "press on the transparent margin does nothing"
+    # Toolbar vs the top edge of the screen (Chrome's tabs): it never wakes, takes clicks or holds the
+    # cursor outside the viewer window.
+    $dock = New-Object Drawing.Rectangle(400, 300, 640, 380)          # the viewer window
+    $pillR = New-Object Drawing.Rectangle(600, 302, 46, 6)            # resting handle, centred on its top edge
+    Check ([SvBar]::NearBar((New-Object Drawing.Point(620, 305)), $pillR, $dock, 0.0, 1.0)) "handle wakes when the pointer is on it"
+    Check ([SvBar]::NearBar((New-Object Drawing.Point(600, 308)), $pillR, $dock, 0.0, 1.0)) "handle wakes on the strip inside the viewer's top edge"
+    Check (-not [SvBar]::NearBar((New-Object Drawing.Point(620, 296)), $pillR, $dock, 0.0, 1.0)) "handle does not wake just above the viewer (tabs above it)"
+    $tabs = New-Object Drawing.Rectangle(0, 0, 1920, 40)              # Chrome tab strip at the top of the screen
+    $dockTop = New-Object Drawing.Rectangle(400, 0, 640, 380)         # viewer pushed against the top edge
+    $pillTop = New-Object Drawing.Rectangle(600, 2, 46, 6)
+    Check (-not [SvBar]::NearBar((New-Object Drawing.Point(100, 10)), $pillTop, $dockTop, 0.0, 1.0)) "handle does not wake over the tabs beside the viewer"
+    Check (-not [SvBar]::NearBar((New-Object Drawing.Point(1500, 10)), $pillTop, $dockTop, 0.0, 1.0)) "handle does not wake on tabs far to the right"
+    Check (-not [SvBar]::NearBar((New-Object Drawing.Point(560, 20)), $pillR, $dock, 1.0, 1.0)) "open pill is not kept awake by a pointer outside the viewer"
+    Check ([SvBar]::TakesMouse((New-Object Drawing.Point(620, 305)), $pillR, $false)) "the pill takes the mouse"
+    Check (-not [SvBar]::TakesMouse((New-Object Drawing.Point(100, 10)), $pillTop, $false)) "everywhere else the bar is click-through"
+    Check ([SvBar]::TakesMouse((New-Object Drawing.Point(100, 10)), $pillTop, $true)) "a slide drag keeps the mouse"
+    # The real bar window: click-through unless the pointer is on the pill (a probe point stands in for
+    # the cursor; no real input is used).
+    $ow = New-Object Windows.Forms.Form
+    $ow.FormBorderStyle = 'None'; $ow.ShowInTaskbar = $false; $ow.StartPosition = 'Manual'; $ow.Opacity = 0
+    $ow.Location = New-Object Drawing.Point(-30000, -30000); $ow.Size = New-Object Drawing.Size(640, 380)
+    $ow.Show()
+    $tb = New-Object SvBar([single]1, 'Segoe MDL2 Assets')
+    $tbb = New-Object SvBarButton; $tbb.Id = 'x'; $tb.Buttons.Add($tbb)
+    $tb.DockRect = $ow.Bounds; $tb.Limit = New-Object Drawing.Rectangle(-30000, -30000, 2000, 2000)
+    $tb.Show($ow)
+    $pb = $tb.PillBounds
+    $tb.Probe = New-Object Drawing.Point(($pb.X + $pb.Width / 2), ($pb.Y + $pb.Height / 2)); $tb.StepNow()
+    Check (-not $tb.ClickThrough) "bar window takes the mouse with the pointer on the pill"
+    $tb.Probe = New-Object Drawing.Point(($pb.X - 300), ($pb.Y - 20)); $tb.StepNow()
+    Check ($tb.ClickThrough) "bar window is click-through with the pointer on the tabs beside it"
+    $tb.Probe = New-Object Drawing.Point(($pb.X + $pb.Width / 2), ($pb.Y - 12)); $tb.StepNow()
+    Check ($tb.ClickThrough) "bar window is click-through just above the pill (its transparent margin)"
+    $tb.Close(); $tb.Dispose(); $ow.Close(); $ow.Dispose()
     # Toolbar visibility: it follows the viewer, and the pin (keep open) never keeps it on screen.
     Check ([SvBar]::ShouldShow($false, $true, $false)) "bar shown with the viewer"
     Check ([SvBar]::ShouldShow($false, $true, $true)) "bar shown with the viewer, pinned"
