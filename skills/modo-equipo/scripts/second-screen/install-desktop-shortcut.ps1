@@ -1,9 +1,9 @@
 # Creates a desktop shortcut that opens the touch viewer (and adds the virtual second screen
-# first when there is none). Run it once, by hand; it copies the three scripts to a stable
+# first when there is none). Run it once, by hand; it copies the viewer scripts to a stable
 # folder so the shortcut keeps working after plugin updates.
 $dest = Join-Path $env:USERPROFILE '.claude\modo-equipo\viewer'
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
-Copy-Item (Join-Path $PSScriptRoot 'open-viewer.ps1'), (Join-Path $PSScriptRoot 'screen-viewer.ps1'), (Join-Path $PSScriptRoot 'parsec-vdd.ps1') -Destination $dest -Force
+Copy-Item (Join-Path $PSScriptRoot 'open-viewer.ps1'), (Join-Path $PSScriptRoot 'screen-viewer.ps1'), (Join-Path $PSScriptRoot 'parsec-vdd.ps1'), (Join-Path $PSScriptRoot 'screen-gpu.ps1') -Destination $dest -Force
 $lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Visor segunda pantalla.lnk'
 $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
 $s.TargetPath = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"

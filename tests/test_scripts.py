@@ -515,6 +515,7 @@ class ParsecVirtualDisplay(unittest.TestCase):
         with open(os.path.join(self.DIR, "open-viewer.ps1"), encoding="utf-8") as f:
             launcher = f.read()
         self.assertIn("parsec-vdd.ps1", install)   # the shortcut copy must include the module
+        self.assertIn("screen-gpu.ps1", install)   # and the GPU mirror the viewer loads from its own folder
         self.assertIn("parsec-vdd.ps1", launcher)
         self.assertIn("Ensure = $true; HolderPid = @($PID)", launcher)   # the viewer holds its session's screen
         self.assertIn("$viewerArgs['Screen'] = $r.screen", launcher)  # and shows that screen

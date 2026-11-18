@@ -13,8 +13,10 @@ param(
 # The screen keeper (parsec-vdd.ps1) keeps the real cursor on the main screen(s) while a virtual
 # screen exists; the viewer lets it cross in direct mode and turns that lock on or off from its
 # toolbar.
-# The picture comes from the Windows Magnification API (GPU, ~60 fps, real cursor shape); when it
-# is not available the viewer falls back to a GDI screen copy.
+# The picture comes from the GPU: the screen is duplicated (Desktop Duplication) and shrunk with a
+# Direct3D 11 Lanczos3 filter (screen-gpu.ps1), so small text stays readable in a small window. If
+# that cannot start the viewer falls back to the Windows Magnification API (GPU, nearest-neighbour
+# scaling, real cursor shape) and then to a GDI screen copy, and says so in its title and log.
 # The window has no Windows title bar: a thin strip on top moves it and its edges resize it.
 # The toolbar is a small rounded pill docked at the top centre (of the window, or of the screen
 # in full screen): it rests as a thin handle, opens while the pointer is near it, can be slid
@@ -31,6 +33,9 @@ param(
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# GPU mirror (Direct3D 11 + Desktop Duplication, Lanczos3 downscale): screen-gpu.ps1 next to this file.
+$script:gpuModuleError = ''
+try { . (Join-Path $PSScriptRoot 'screen-gpu.ps1') } catch { $script:gpuModuleError = $_.Exception.Message }
 
 Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing @"
 using System;
@@ -968,6 +973,22 @@ if ($SelfTest) {
     # Letterbox: a 16:9 screen in a 4:3 box gets bars on top and bottom only.
     $lb = Get-LetterBox 640 480 $b
     Check ($lb.X -eq 0 -and $lb.Y -eq 60 -and $lb.W -eq 640 -and $lb.H -eq 360) "letterbox 4:3 got=$($lb.X),$($lb.Y),$($lb.W),$($lb.H)"
+    # GPU mirror: shrink a test picture on the GPU (no window, no screen) and check it is filtered,
+    # not nearest-neighbour: a black bar must have grey edge pixels, white stays white.
+    if ('SvGpu' -as [type]) {
+        try {
+            $tb = New-Object Drawing.Bitmap(200, 120, [Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $tg = [Drawing.Graphics]::FromImage($tb); $tg.Clear([Drawing.Color]::White)
+            $tg.FillRectangle([Drawing.Brushes]::Black, 83, 20, 36, 80); $tg.Dispose()
+            $o = [SvGpu]::SelfRender($tb, 80, 48); $tb.Dispose()
+            Check ($o.Length -eq 80 * 48 * 4) "gpu downscale returns 80x48 pixels"
+            $px = { param($x, $y) $o[($y * 80 + $x) * 4 + 1] }
+            Check ((& $px 2 2) -ge 253 -and (& $px 77 45) -ge 253) "gpu downscale keeps white white"
+            Check ((& $px 40 24) -le 4) "gpu downscale keeps the black bar black"
+            $edge = 0; foreach ($x in 30..36) { $v = & $px $x 24; if ($v -gt 25 -and $v -lt 230) { $edge++ } }
+            Check ($edge -ge 1) "gpu downscale filters the bar edge (grey pixels), not nearest-neighbour"
+        } catch { "INFO gpu self-render not available here: $($_.Exception.Message)" }
+    } else { "INFO gpu module not loaded: $script:gpuModuleError" }
     $lb = Get-LetterBox 1920 1080 ([pscustomobject]@{ X = 2400; Y = 0; Width = 2400; Height = 1350 })
     Check ($lb.X -eq 0 -and $lb.Y -eq 0 -and $lb.W -eq 1920 -and $lb.H -eq 1080 -and [Math]::Abs($lb.Scale - 0.8) -lt 0.0001) "letterbox full got=$($lb.X),$($lb.Y),$($lb.W),$($lb.H),$($lb.Scale)"
     # Toolbar: centred on the window's top edge, slid by dragging only along that edge, and kept
@@ -1156,6 +1177,11 @@ $script:showPointer = $true
 $script:keepBar = $false
 $script:mag = [IntPtr]::Zero
 $script:magOk = $false
+$script:gpu = $null
+$script:gpuHost = $null
+$script:gpuOk = $false
+$script:gpuScreen = ''
+$script:rendererNote = ''
 $script:pic = $null
 $script:magBounds = $null
 $script:clock = [Diagnostics.Stopwatch]::StartNew()
@@ -1171,7 +1197,7 @@ function Update-Title {
     if (-not $s) { return }
     $short = $s.DeviceName -replace '^\\\\\.\\', ''
     $id = Get-SessionOf $s.DeviceName
-    $form.Text = "Test screen $short$(if ($id) { " ($id)" }) - live, touch"
+    $form.Text = "Test screen $short$(if ($id) { " ($id)" }) - live, touch$(if ($script:rendererNote) { ' [basic scaling]' })"
 }
 $form.Text = "Test screen (live, touch)"
 $form.FormBorderStyle = 'None'
@@ -1410,6 +1436,7 @@ function Switch-Screen {
 function Switch-Pointer {
     $script:showPointer = -not $script:showPointer
     if ($script:magOk) { [SvMag]::SetCursorVisible($script:mag, $script:showPointer) }
+    if ($script:gpuOk) { $script:gpu.PointerOn = $script:showPointer }
     Update-Glyphs
 }
 
@@ -1439,7 +1466,27 @@ function Switch-Mute {
 }
 
 # --- picture: Magnification API, or GDI copy as fallback ------------------------------------
-function Initialize-View {
+# The GPU mirror on the current screen. Returns $true when it runs; otherwise $script:rendererNote says why.
+function Start-GpuView {
+    if ($env:MODO_EQUIPO_NO_GPU -eq '1') { $script:rendererNote = 'GPU mirror turned off (MODO_EQUIPO_NO_GPU=1)'; return $false }
+    if (-not ('SvGpu' -as [type])) { $script:rendererNote = "GPU mirror module not loaded: $script:gpuModuleError"; return $false }
+    $s = Get-SecondScreen
+    if (-not $s) { return $false }
+    $lb = Get-LetterBox $view.ClientSize.Width $view.ClientSize.Height $s.Bounds
+    try {
+        if (-not $script:gpuHost) { $script:gpuHost = New-Object SvGpuHost; $view.Controls.Add($script:gpuHost) }
+        $script:gpuHost.SetBounds($lb.X, $lb.Y, [Math]::Max(1, $lb.W), [Math]::Max(1, $lb.H))
+        [void]$script:gpuHost.Handle
+        $gpu = New-Object SvGpu
+        $gpu.PointerOn = $script:showPointer
+        if (-not $gpu.Start($script:gpuHost.Handle, $s.DeviceName, [Math]::Max(1, $lb.W), [Math]::Max(1, $lb.H))) { $script:rendererNote = $gpu.Error; return $false }
+        $script:gpu = $gpu; $script:gpuScreen = $s.DeviceName; $script:rendererNote = ''
+        return $true
+    } catch { $script:rendererNote = $_.Exception.Message; return $false }
+}
+
+# Magnification API picture, or the GDI copy when even that is not available.
+function Use-BasicView {
     $script:magOk = [SvMag]::Init()
     if ($script:magOk) {
         $script:mag = [SvMag]::Create($view.Handle, $script:showPointer)
@@ -1452,11 +1499,50 @@ function Initialize-View {
         $view.Controls.Add($script:pic)
     }
     if ($script:magOk) { [SvDrive]::Picture = $script:mag }
-    Write-ViewerLog "renderer=$(if ($script:magOk) { 'magnification' } else { 'gdi' })"
+}
+
+function Initialize-View {
+    if (Start-GpuView) {
+        $script:gpuOk = $true
+    } else {
+        if ($script:rendererNote) { Write-ViewerLog "gpu renderer unavailable, using basic scaling: $($script:rendererNote)" }
+        Use-BasicView
+    }
+    Write-ViewerLog "renderer=$(if ($script:gpuOk) { 'gpu (Direct3D 11 Lanczos3)' } elseif ($script:magOk) { 'magnification' } else { 'gdi' })"
+    Update-Title
+    Update-MagLayout
+}
+
+# The GPU mirror stopped (or the screen it mirrors cannot be duplicated any more): keep going with
+# the basic picture and say so.
+function Switch-ToBasic($why) {
+    Write-ViewerLog "gpu renderer stopped, using basic scaling: $why"
+    $script:rendererNote = $why
+    try { $script:gpu.Stop() } catch {}
+    $script:gpuOk = $false
+    if ($script:gpuHost) { $view.Controls.Remove($script:gpuHost); $script:gpuHost.Dispose(); $script:gpuHost = $null }
+    Use-BasicView
+    $script:magBounds = $null
+    Update-Title
     Update-MagLayout
 }
 
 function Update-MagLayout {
+    if ($script:gpuOk) {
+        $s = Get-SecondScreen
+        if (-not $s) { return }
+        if ($s.DeviceName -ne $script:gpuScreen) {
+            # another screen: duplicate that one instead
+            try { $script:gpu.Stop() } catch {}
+            $script:gpuOk = $false
+            if (Start-GpuView) { $script:gpuOk = $true } else { Switch-ToBasic $script:rendererNote; return }
+        }
+        $lb = Get-LetterBox $view.ClientSize.Width $view.ClientSize.Height $s.Bounds
+        $script:gpuHost.SetBounds($lb.X, $lb.Y, [Math]::Max(1, $lb.W), [Math]::Max(1, $lb.H))
+        $script:gpu.Resize([Math]::Max(1, $lb.W), [Math]::Max(1, $lb.H))
+        $script:magBounds = $s.Bounds
+        return
+    }
     if (-not $script:magOk) { return }
     $s = Get-SecondScreen
     if (-not $s) { return }
@@ -1504,6 +1590,7 @@ function Test-OverImage($cur) {
     $h = [SvNative]::WindowFromPoint($pt)
     if ($h -eq $view.Handle) { return $true }
     if ($script:magOk -and $h -eq $script:mag) { return $true }
+    if ($script:gpuHost -and $h -eq $script:gpuHost.Handle) { return $true }
     if ($script:pic -and $h -eq $script:pic.Handle) { return $true }
     return $false
 }
@@ -1618,8 +1705,13 @@ $timer.Add_Tick({
     # Faster ticks while the cursor is driven or the image fills the screen.
     $want = if ($script:remote) { 8 } else { 16 }
     if ($timer.Interval -ne $want) { $timer.Interval = $want }
+    if ($script:gpuOk) { $script:gpu.Paused = ($form.WindowState -eq 'Minimized') }
     if ($form.WindowState -eq 'Minimized') { return }
-    if ($script:magOk) {
+    if ($script:gpuOk) {
+        # The GPU thread draws by itself; here only failures and layout changes are watched.
+        if ($script:gpu.Failed) { Switch-ToBasic $script:gpu.Error }
+        elseif ($s.DeviceName -ne $script:gpuScreen -or -not $script:magBounds -or $script:magBounds -ne $b) { Update-MagLayout }
+    } elseif ($script:magOk) {
         # GPU picture: ~60 fps while in use or in full screen, ~30 fps when just watching.
         $every = if ($script:remote -or $script:full) { 15 } else { 32 }
         if (($now - $script:lastFrameMs) -ge $every) {
@@ -1687,6 +1779,7 @@ $form.Add_FormClosed({
     Return-CursorFree
     try { [SvAutoMute]::Stop() } catch {}
     $script:input.Close()
+    if ($script:gpuOk) { try { $script:gpu.Stop() } catch {} }
     if ($script:magOk) { [SvMag]::Shutdown() }
     [SvNative]::timeEndPeriod(1) | Out-Null
 })
