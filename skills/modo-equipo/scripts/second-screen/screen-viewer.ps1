@@ -1870,6 +1870,7 @@ $form.Add_Shown({
             $script:stop.Stop()
             $s = Get-SecondScreen
             $b = $s.Bounds
+            if ($script:gpuOk) { Write-ViewerLog "smoke gpu frames=$($script:gpu.Frames) fps=$([Math]::Round($script:gpu.Fps,1)) source=$($script:gpu.SourceWidth)x$($script:gpu.SourceHeight) picture=$($script:gpu.Width)x$($script:gpu.Height) failed=$($script:gpu.Failed) $($script:gpu.Error)" }
             Write-ViewerLog "smoke toolbar=$($bar.PillBounds) open=$($bar.IsOpen) visible=$($bar.Visible) form=$($form.Bounds)"
             try {
                 $names = [SvAudio]::ProcessNamesOn($b.X, $b.Y, $b.Width, $b.Height, $PID)
