@@ -99,6 +99,8 @@ public class SvBar : Form {
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
     [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr o);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
 
     public readonly List<SvBarButton> Buttons = new List<SvBarButton>();
     public Rectangle DockRect;          // the bar is centred on the top edge of this rectangle
@@ -213,8 +215,24 @@ public class SvBar : Form {
     }
 
     // --- behaviour ------------------------------------------------------------------------
+    // The bar is only on screen while its viewer is: hidden when the viewer is minimized or
+    // hidden, whatever KeepOpen says (KeepOpen only stops it folding into the handle).
+    public static bool ShouldShow(bool ownerMinimized, bool ownerVisible, bool keepOpen) {
+        return ownerVisible && !ownerMinimized;
+    }
+    public static bool OwnerShown(Form o, bool keepOpen) {
+        return o != null && o.IsHandleCreated && ShouldShow(IsIconic(o.Handle), IsWindowVisible(o.Handle), keepOpen);
+    }
     void Step() {
         if (!Visible) return;
+        // Win32 state of the viewer window, so every way of minimizing it counts (its own button,
+        // the taskbar, Win+M, a shell command), not only what WinForms reported.
+        Form o = Owner;
+        if (o != null && !OwnerShown(o, KeepOpen)) {
+            if (tipShown) { tip.Hide(this); tipShown = false; }
+            Hide();
+            return;
+        }
         long now = clock.ElapsedMilliseconds;
         Point c = Cursor.Position;
         Rectangle pill = PillBounds;
@@ -921,6 +939,12 @@ if ($SelfTest) {
     $left = [SvDrive]::Advance([ref]$x, [ref]$y, 5, 0, 0.5, $sb, $true, [ref]$ox, [ref]$oy)
     Check (-not $left -and $x -eq 3839) "drive clamps while a button is held got=$x"
     Check (-not [SvAutoMute]::On) "auto mute starts off"
+    # Toolbar visibility: it follows the viewer, and the pin (keep open) never keeps it on screen.
+    Check ([SvBar]::ShouldShow($false, $true, $false)) "bar shown with the viewer"
+    Check ([SvBar]::ShouldShow($false, $true, $true)) "bar shown with the viewer, pinned"
+    Check (-not [SvBar]::ShouldShow($true, $true, $true)) "pinned bar hidden while the viewer is minimized"
+    Check (-not [SvBar]::ShouldShow($true, $true, $false)) "bar hidden while the viewer is minimized"
+    Check (-not [SvBar]::ShouldShow($false, $false, $true)) "pinned bar hidden while the viewer is hidden"
     Write-Output "selftest: $($total - $fail)/$total passed"
     exit $fail
 }
@@ -1327,6 +1351,12 @@ function Exit-Remote($b, $overX, $overY) {
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 16
 $timer.Add_Tick({
+    # The toolbar follows the viewer: SvBar hides itself while the viewer is minimized or hidden
+    # (pinned or not); it comes back here once the viewer is shown again.
+    if (-not $bar.Visible -and [SvBar]::OwnerShown($form, $script:keepBar)) {
+        Update-ToolbarPlacement
+        $bar.Show($form)
+    }
     $s = Get-SecondScreen
     if (-not $s) {
         [SvDrive]::Stop()
@@ -1419,7 +1449,22 @@ $form.Add_Shown({
         # Halfway through, open the toolbar so both of its states can be checked.
         $script:half = New-Object Windows.Forms.Timer
         $script:half.Interval = [Math]::Max(1, [int]($SmokeSeconds * 500))
-        $script:half.Add_Tick({ $script:half.Stop(); $bar.ForceOpen = $true; Write-ViewerLog "smoke toolbar opened" })
+        $script:half.Add_Tick({
+            $script:half.Stop(); $bar.ForceOpen = $true; Write-ViewerLog "smoke toolbar opened"
+            # Then: pin the bar, minimize the viewer, restore it; log whether the bar is on screen.
+            $script:visStep = 0
+            $script:vis = New-Object Windows.Forms.Timer
+            $script:vis.Interval = 400
+            $script:vis.Add_Tick({
+                $script:visStep++
+                switch ($script:visStep) {
+                    1 { $script:keepBar = $true; Update-Glyphs; $form.WindowState = 'Minimized' }
+                    2 { Write-ViewerLog "smoke pinned+minimized bar visible=$($bar.Visible)"; $form.WindowState = 'Normal' }
+                    3 { Write-ViewerLog "smoke restored bar visible=$($bar.Visible)"; $script:vis.Stop() }
+                }
+            })
+            $script:vis.Start()
+        })
         $script:half.Start()
     }
 })
