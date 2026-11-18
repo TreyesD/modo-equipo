@@ -540,7 +540,8 @@ interface ISvSimpleAudioVolume {
     [PreserveSig] int GetMute(out int mute);
 }
 
-// Mute the apps shown on the second screen (Windows has no per-screen mute).
+// Mute the apps shown on the mirrored screen (Windows has no per-screen mute). Only per-app audio
+// sessions (ISimpleAudioVolume) are touched: never the master volume, never a device.
 public static class SvAudio {
     delegate bool EnumProc(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
@@ -549,33 +550,55 @@ public static class SvAudio {
     [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out SvRect r);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+    [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int v, int size);
+    [DllImport("ole32.dll")] static extern void CoTaskMemFree(IntPtr p);
 
     // Windows shell processes own the desktop and taskbar on every screen; never mute them.
     static readonly string[] Shell = { "explorer", "shellexperiencehost", "startmenuexperiencehost", "textinputhost", "applicationframehost", "searchhost", "searchapp" };
 
-    // Process names of the visible windows whose center is on the given screen area.
-    public static string[] ProcessNamesOn(int x, int y, int w, int h, int ownPid) {
-        List<string> names = new List<string>();
-        EnumWindows(delegate (IntPtr hw, IntPtr l) {
-            if (!IsWindowVisible(hw) || IsIconic(hw) || GetWindowTextLength(hw) == 0) return true;
-            SvRect r; if (!GetWindowRect(hw, out r)) return true;
-            int cx = (r.Left + r.Right) / 2, cy = (r.Top + r.Bottom) / 2;
-            if (cx < x || cx >= x + w || cy < y || cy >= y + h) return true;
-            uint pid; GetWindowThreadProcessId(hw, out pid);
-            if ((int)pid == ownPid || pid == 0) return true;
-            try {
-                string n = Process.GetProcessById((int)pid).ProcessName;
-                if (Array.IndexOf(Shell, n.ToLowerInvariant()) < 0 && !names.Contains(n)) names.Add(n);
-            } catch { }
-            return true;
-        }, IntPtr.Zero);
-        return names.ToArray();
+    // The rule. names[i] has a visible window; inArea[i] says whether that window is on the mirrored
+    // screen. An app is muted only when ALL its visible windows are on that screen ("only"); an app
+    // with windows on the mirrored screen and elsewhere is left alone and reported ("shared"), so
+    // sound from other screens is never cut.
+    public static void Split(string[] names, bool[] inArea, out string[] only, out string[] shared) {
+        Dictionary<string, int> state = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        List<string> order = new List<string>();
+        for (int i = 0; i < names.Length; i++) {
+            int v; if (!state.TryGetValue(names[i], out v)) { order.Add(names[i]); v = 0; }
+            state[names[i]] = v | (inArea[i] ? 1 : 2);
+        }
+        List<string> o = new List<string>(), sh = new List<string>();
+        foreach (string n in order) { int v = state[n]; if (v == 1) o.Add(n); else if (v == 3) sh.Add(n); }
+        only = o.ToArray(); shared = sh.ToArray();
     }
 
-    // Session selection: a session belongs to an app on the second screen when its process has
-    // the same name as one of that screen's window processes (exact name, any case). Matching by
-    // name covers apps whose sound comes from a helper process with the same name (Chrome's
-    // audio service), at the cost of muting that app's other windows too.
+    // Visible, titled, not minimized and not cloaked (another virtual desktop) windows, by process
+    // name, split by whether their center is on the screen area.
+    public static void Classify(int x, int y, int w, int h, int ownPid, out string[] only, out string[] shared) {
+        List<string> names = new List<string>(); List<bool> inArea = new List<bool>();
+        EnumWindows(delegate (IntPtr hw, IntPtr l) {
+            if (!IsWindowVisible(hw) || IsIconic(hw) || GetWindowTextLength(hw) == 0) return true;
+            int cloaked; if (DwmGetWindowAttribute(hw, 14, out cloaked, 4) == 0 && cloaked != 0) return true;   // DWMWA_CLOAKED
+            SvRect r; if (!GetWindowRect(hw, out r)) return true;
+            uint pid; GetWindowThreadProcessId(hw, out pid);
+            if ((int)pid == ownPid || pid == 0) return true;
+            string n;
+            try { n = Process.GetProcessById((int)pid).ProcessName; } catch { return true; }
+            if (Array.IndexOf(Shell, n.ToLowerInvariant()) >= 0) return true;
+            int cx = (r.Left + r.Right) / 2, cy = (r.Top + r.Bottom) / 2;
+            names.Add(n); inArea.Add(!(cx < x || cx >= x + w || cy < y || cy >= y + h));
+            return true;
+        }, IntPtr.Zero);
+        Split(names.ToArray(), inArea.ToArray(), out only, out shared);
+    }
+    // Names that would be muted (kept for the developer smoke check).
+    public static string[] ProcessNamesOn(int x, int y, int w, int h, int ownPid) {
+        string[] only, shared; Classify(x, y, w, h, ownPid, out only, out shared); return only;
+    }
+
+    // Session selection: a session belongs to an app when its process has the same name as the
+    // app's window process (exact name, any case). Matching by name covers apps whose sound comes
+    // from a helper process with the same name (Chrome's audio service).
     public static bool Wanted(string processName, string[] names) {
         if (string.IsNullOrEmpty(processName) || names == null) return false;
         foreach (string want in names)
@@ -583,17 +606,18 @@ public static class SvAudio {
         return false;
     }
 
-    // Set mute on every audio session, on every active output device, whose process is wanted.
-    // Returns how many sessions were changed; LastError holds the last per-session failure.
     public static string LastError = "";
     public static Guid VolumeIid { get { return typeof(ISvSimpleAudioVolume).GUID; } }
-    public static int SetMute(string[] names, bool mute) {
-        LastError = "";
+    // id = the session identifier (device + executable), the same for every run of an app: Windows
+    // remembers an app's mute state under it, so a mute left behind by a crash would come back
+    // the next time the app starts, and the restore list must match the new process too.
+    delegate void Visit(ISvAudioSessionControl2 c, string name, string id);
+    // Every audio session on every active output device.
+    static void EachSession(Visit visit) {
         ISvMMDeviceEnumerator en = (ISvMMDeviceEnumerator)(new SvMMDeviceEnumerator());
         ISvMMDeviceCollection devices;
         Marshal.ThrowExceptionForHR(en.EnumAudioEndpoints(0, 1, out devices));   // render, DEVICE_STATE_ACTIVE
-        int nd, changed = 0;
-        devices.GetCount(out nd);
+        int nd; devices.GetCount(out nd);
         for (int d = 0; d < nd; d++) {
             ISvMMDevice dev;
             if (devices.Item(d, out dev) != 0 || dev == null) continue;
@@ -602,48 +626,80 @@ public static class SvAudio {
             if (dev.Activate(ref iid, 23, IntPtr.Zero, out o) != 0) continue;
             ISvAudioSessionEnumerator se;
             if (((ISvAudioSessionManager2)o).GetSessionEnumerator(out se) != 0) continue;
-            int n;
-            se.GetCount(out n);
+            int n; se.GetCount(out n);
             for (int i = 0; i < n; i++) {
                 ISvAudioSessionControl2 c;
                 if (se.GetSession(i, out c) != 0 || c == null) continue;
                 uint pid; c.GetProcessId(out pid);
                 if (pid == 0) continue;
-                string pn = "";
-                try { pn = Process.GetProcessById((int)pid).ProcessName; } catch { continue; }
-                if (!Wanted(pn, names)) continue;
-                try {
-                    Guid g = Guid.Empty;
-                    int hr = ((ISvSimpleAudioVolume)c).SetMute(mute ? 1 : 0, ref g);
-                    if (hr == 0) changed++; else LastError = pn + ": 0x" + hr.ToString("X8");
-                } catch (Exception ex) { LastError = pn + ": " + ex.Message; }
+                string pn; try { pn = Process.GetProcessById((int)pid).ProcessName; } catch { continue; }
+                string id = "";
+                IntPtr ip;
+                if (c.GetSessionIdentifier(out ip) == 0 && ip != IntPtr.Zero) { id = Marshal.PtrToStringUni(ip); CoTaskMemFree(ip); }
+                try { visit(c, pn, id); } catch (Exception ex) { LastError = pn + ": " + ex.Message; }
             }
         }
-        return changed;
     }
 
+    // Records the current mute state of the sessions of the given apps into prior (nothing is changed).
+    // Called, and the list saved, before muting: a crash right after muting must still be undoable.
+    public static void Remember(string[] names, Dictionary<string, int> prior) {
+        EachSession(delegate (ISvAudioSessionControl2 c, string pn, string id) {
+            if (!Wanted(pn, names) || id == "" || prior.ContainsKey(id)) return;
+            int m = 0; ((ISvSimpleAudioVolume)c).GetMute(out m); prior[id] = m;
+        });
+    }
+    // Mutes the sessions of the given apps. prior remembers each session's mute state from before,
+    // so unmuting later puts back exactly what was there (a session the user had muted stays muted).
+    public static int Mute(string[] names, Dictionary<string, int> prior) {
+        LastError = "";
+        int changed = 0;
+        EachSession(delegate (ISvAudioSessionControl2 c, string pn, string id) {
+            if (!Wanted(pn, names) || id == "") return;
+            ISvSimpleAudioVolume v = (ISvSimpleAudioVolume)c;
+            if (!prior.ContainsKey(id)) { int m = 0; v.GetMute(out m); prior[id] = m; }
+            Guid g = Guid.Empty;
+            int hr = v.SetMute(1, ref g);
+            if (hr == 0) changed++; else LastError = pn + ": 0x" + hr.ToString("X8");
+        });
+        return changed;
+    }
+    // Puts back the earlier mute state of every remembered session whose app is not in keepMuted,
+    // and forgets it. Returns how many sessions were restored.
+    public static int Restore(Dictionary<string, int> prior, string[] keepMuted) {
+        if (prior.Count == 0) return 0;
+        int restored = 0; List<string> gone = new List<string>();
+        Dictionary<string, int> snapshot = new Dictionary<string, int>(prior);
+        EachSession(delegate (ISvAudioSessionControl2 c, string pn, string id) {
+            int m; if (!snapshot.TryGetValue(id, out m) || Wanted(pn, keepMuted)) return;
+            Guid g = Guid.Empty;
+            if (((ISvSimpleAudioVolume)c).SetMute(m, ref g) == 0) restored++;
+            gone.Add(id);
+        });
+        foreach (string id in gone) prior.Remove(id);
+        // sessions that no longer exist cannot be restored; drop them unless their app should stay muted
+        if (keepMuted == null || keepMuted.Length == 0) prior.Clear();
+        return restored;
+    }
+    // Name-based mute switch (developer checks only).
+    public static int SetMute(string[] names, bool mute) {
+        LastError = ""; int changed = 0;
+        EachSession(delegate (ISvAudioSessionControl2 c, string pn, string id) {
+            if (!Wanted(pn, names)) return;
+            Guid g = Guid.Empty;
+            int hr = ((ISvSimpleAudioVolume)c).SetMute(mute ? 1 : 0, ref g);
+            if (hr == 0) changed++; else LastError = pn + ": 0x" + hr.ToString("X8");
+        });
+        return changed;
+    }
     // Mute state of the sessions of the given process names (for checks): "name=0/1" pairs.
     public static string[] MuteStates(string[] names) {
         List<string> r = new List<string>();
-        ISvMMDeviceEnumerator en = (ISvMMDeviceEnumerator)(new SvMMDeviceEnumerator());
-        ISvMMDeviceCollection devices;
-        if (en.EnumAudioEndpoints(0, 1, out devices) != 0) return r.ToArray();
-        int nd; devices.GetCount(out nd);
-        for (int d = 0; d < nd; d++) {
-            ISvMMDevice dev; if (devices.Item(d, out dev) != 0) continue;
-            Guid iid = typeof(ISvAudioSessionManager2).GUID; object o;
-            if (dev.Activate(ref iid, 23, IntPtr.Zero, out o) != 0) continue;
-            ISvAudioSessionEnumerator se; if (((ISvAudioSessionManager2)o).GetSessionEnumerator(out se) != 0) continue;
-            int n; se.GetCount(out n);
-            for (int i = 0; i < n; i++) {
-                ISvAudioSessionControl2 c; if (se.GetSession(i, out c) != 0 || c == null) continue;
-                uint pid; c.GetProcessId(out pid); if (pid == 0) continue;
-                string pn; try { pn = Process.GetProcessById((int)pid).ProcessName; } catch { continue; }
-                if (!Wanted(pn, names)) continue;
-                int m = -1; try { ((ISvSimpleAudioVolume)c).GetMute(out m); } catch { }
-                r.Add(pn + "=" + m);
-            }
-        }
+        EachSession(delegate (ISvAudioSessionControl2 c, string pn, string id) {
+            if (!Wanted(pn, names)) return;
+            int m = -1; try { ((ISvSimpleAudioVolume)c).GetMute(out m); } catch { }
+            r.Add(pn + "=" + m);
+        });
         return r.ToArray();
     }
 }
@@ -690,21 +746,30 @@ public static class SvClip {
     public static void Release() { ClipCursor(IntPtr.Zero); }
 }
 
-// Sticky mute for the second screen: while on, a background thread mutes, about once a second,
-// every app whose window is on that screen, so apps that start playing later are muted too.
-// Turning it off (or closing the viewer) unmutes every app it muted.
+// Sticky mute for the mirrored screen (this viewer instance's screen, whichever it is): while on, a
+// background thread, about once a second, mutes the apps whose windows are all on that screen, so
+// apps that start playing later are muted too. An app that also has a window on another screen is
+// left alone ("Shared"). Turning it off, closing the viewer, or the next start after a crash puts
+// every session back exactly as it was.
 public static class SvAutoMute {
     static readonly object gate = new object();
+    static readonly object applyLock = new object();
     static System.Threading.Thread worker;
     static volatile bool on;
+    static bool hooked;
     static Rectangle area;
     static int ownPid;
-    static readonly List<string> done = new List<string>();
+    static readonly Dictionary<string, int> prior = new Dictionary<string, int>();
+    static string[] only = new string[0], shared = new string[0];
     public static string LastError = "";
+    public static string StateDir = "";   // where the restore list is kept (so a crash can be undone)
     public static bool On { get { return on; } }
-    public static string[] Muted { get { lock (gate) { return done.ToArray(); } } }
+    public static string[] Muted { get { lock (gate) { return only; } } }
+    public static string[] Shared { get { lock (gate) { return shared; } } }
+    static string StateFile { get { return StateDir == "" ? "" : System.IO.Path.Combine(StateDir, "muted-" + Process.GetCurrentProcess().Id + ".txt"); } }
     public static void Start(Rectangle screen, int pid) {
         lock (gate) { area = screen; ownPid = pid; on = true; }
+        if (!hooked) { hooked = true; AppDomain.CurrentDomain.ProcessExit += delegate { try { Stop(); } catch { } }; }
         Apply();
         if (worker == null) {
             worker = new System.Threading.Thread(Loop);
@@ -714,9 +779,11 @@ public static class SvAutoMute {
     }
     public static void SetArea(Rectangle screen) { lock (gate) { area = screen; } }
     public static void Stop() {
-        string[] names;
-        lock (gate) { on = false; names = done.ToArray(); done.Clear(); }
-        if (names.Length > 0) { try { SvAudio.SetMute(names, false); } catch { } }
+        lock (applyLock) {
+            lock (gate) { on = false; only = new string[0]; shared = new string[0]; }
+            try { SvAudio.Restore(prior, null); } catch { }
+            Save();
+        }
     }
     static void Loop() {
         while (true) {
@@ -724,19 +791,56 @@ public static class SvAutoMute {
             if (on) { try { Apply(); } catch (Exception ex) { LastError = ex.Message; } }
         }
     }
+    static void Save() {
+        string f = StateFile; if (f == "") return;
+        try {
+            if (prior.Count == 0) { if (System.IO.File.Exists(f)) System.IO.File.Delete(f); return; }
+            List<string> lines = new List<string>();
+            foreach (KeyValuePair<string, int> kv in prior) lines.Add(kv.Value + "\t" + kv.Key);
+            System.IO.Directory.CreateDirectory(StateDir);
+            System.IO.File.WriteAllLines(f, lines.ToArray());
+        } catch { }
+    }
+    // Undoes the mute of a viewer that died without unmuting: every muted-<pid>.txt whose process
+    // is gone puts its sessions back. Returns how many files were handled.
+    public static int Recover(string dir) {
+        int handled = 0;
+        if (string.IsNullOrEmpty(dir) || !System.IO.Directory.Exists(dir)) return 0;
+        foreach (string f in System.IO.Directory.GetFiles(dir, "muted-*.txt")) {
+            string name = System.IO.Path.GetFileNameWithoutExtension(f);
+            int pid; if (!int.TryParse(name.Substring(6), out pid)) continue;
+            bool alive = false;
+            try { Process.GetProcessById(pid); alive = true; } catch { }
+            if (alive) continue;
+            Dictionary<string, int> old = new Dictionary<string, int>();
+            try {
+                foreach (string line in System.IO.File.ReadAllLines(f)) {
+                    int t = line.IndexOf('\t'); int m;
+                    if (t > 0 && int.TryParse(line.Substring(0, t), out m)) old[line.Substring(t + 1)] = m;
+                }
+                SvAudio.Restore(old, null);
+            } catch { }
+            try { System.IO.File.Delete(f); } catch { }
+            handled++;
+        }
+        return handled;
+    }
     // Returns how many sessions were muted in this pass.
     public static int Apply() {
-        Rectangle a; int pid;
-        lock (gate) { if (!on) return 0; a = area; pid = ownPid; }
-        string[] names = SvAudio.ProcessNamesOn(a.X, a.Y, a.Width, a.Height, pid);
-        if (names.Length == 0) return 0;
-        int n = SvAudio.SetMute(names, true);
-        LastError = SvAudio.LastError;
-        lock (gate) {
-            if (!on) { SvAudio.SetMute(names, false); return 0; }   // turned off meanwhile
-            foreach (string x in names) if (!done.Contains(x)) done.Add(x);
+        lock (applyLock) {
+            Rectangle a; int pid;
+            lock (gate) { if (!on) return 0; a = area; pid = ownPid; }
+            string[] o, sh;
+            SvAudio.Classify(a.X, a.Y, a.Width, a.Height, pid, out o, out sh);
+            if (o.Length > 0) { SvAudio.Remember(o, prior); Save(); }
+            int n = o.Length > 0 ? SvAudio.Mute(o, prior) : 0;
+            LastError = SvAudio.LastError;
+            // apps that moved off the screen, or also opened a window elsewhere, get their sound back
+            SvAudio.Restore(prior, o.Length > 0 ? o : new string[] { "\u0001" });
+            lock (gate) { if (!on) { SvAudio.Restore(prior, null); Save(); return 0; } only = o; shared = sh; }
+            Save();
+            return n;
         }
-        return n;
     }
 }
 
@@ -1032,6 +1136,21 @@ if ($SelfTest) {
     $left = [SvDrive]::Advance([ref]$x, [ref]$y, 5, 0, 0.5, $sb, $true, [ref]$ox, [ref]$oy)
     Check (-not $left -and $x -eq 3839) "drive clamps while a button is held got=$x"
     Check (-not [SvAutoMute]::On) "auto mute starts off"
+    # Mute scope: only apps whose windows are ALL on the mirrored screen; one with a window on another
+    # screen keeps its sound ("shared"); an app only on another screen is never touched.
+    $o = $null; $sh = $null
+    [SvAudio]::Split([string[]]@('game', 'chrome', 'chrome', 'chat', 'Chat', 'music'), [bool[]]@($true, $true, $false, $true, $true, $false), [ref]$o, [ref]$sh)
+    Check ((@($o) -join ',') -eq 'game,chat') "mute: apps entirely on the mirrored screen are muted (got $(@($o) -join ','))"
+    Check ((@($sh) -join ',') -eq 'chrome') "mute: an app also on another screen is not muted, only reported (got $(@($sh) -join ','))"
+    Check (@($o) -notcontains 'music' -and @($sh) -notcontains 'music') "mute: an app only on another screen is never touched"
+    # A viewer that died without unmuting is undone at the next start; a live viewer's list is kept.
+    $md = Join-Path ([IO.Path]::GetTempPath()) ("svmute-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $md | Out-Null
+    Set-Content -Path (Join-Path $md 'muted-999999.txt') -Value "0`tno-such-session"
+    Set-Content -Path (Join-Path $md "muted-$PID.txt") -Value "0`tno-such-session"
+    $handled = [SvAutoMute]::Recover($md)
+    Check ($handled -eq 1 -and -not (Test-Path (Join-Path $md 'muted-999999.txt')) -and (Test-Path (Join-Path $md "muted-$PID.txt"))) "mute: a dead viewer's restore list is applied and removed, a live one's is kept"
+    Remove-Item -Recurse -Force $md
     # Next-screen button order.
     Check ((Get-NextScreenName @('A', 'B', 'C') 'A') -eq 'B') "next screen after A"
     Check ((Get-NextScreenName @('A', 'B', 'C') 'C') -eq 'A') "next screen wraps around"
@@ -1177,6 +1296,10 @@ $script:showPointer = $true
 $script:keepBar = $false
 $script:mag = [IntPtr]::Zero
 $script:magOk = $false
+# Sound a crashed viewer left muted is put back first; then this viewer keeps its own restore list.
+$script:muteStateDir = Join-Path $env:USERPROFILE '.claude\modo-equipo\viewer'
+[SvAutoMute]::StateDir = $script:muteStateDir
+try { $n = [SvAutoMute]::Recover($script:muteStateDir); if ($n) { Write-ViewerLog "restored sound left muted by $n earlier viewer(s)" } } catch {}
 $script:gpu = $null
 $script:gpuHost = $null
 $script:gpuOk = $false
@@ -1305,7 +1428,8 @@ function Update-Glyphs {
     $muteOn = [SvAutoMute]::On
     $btnMute.Glyph = if ($muteOn) { [string][char]0xE74F } else { [string][char]0xE767 }
     $btnMute.On = $muteOn
-    $btnMute.Tip = if ($muteOn) { "Second screen sound: muted (the apps on that screen, including ones that start playing later). Click to unmute" } else { "Second screen sound: on. Click to mute the apps on that screen (Windows has no per-screen mute)" }
+    $sharedNote = if ($muteOn -and [SvAutoMute]::Shared.Count) { " Not muted because they also have a window on another screen: $([SvAutoMute]::Shared -join ', ')." } else { '' }
+    $btnMute.Tip = if ($muteOn) { "Mute: only the apps whose windows are all on this mirrored screen are muted (also ones that start playing later); other screens keep their sound.$sharedNote Click to unmute" } else { "Mute: silences only the apps on the screen this viewer shows; sound from other screens is not touched (Windows has no per-screen mute)" }
     $cur = Get-SecondScreen
     $others = Get-OtherScreens
     $btnScreen.Glyph = [string][char]0xE7F4
@@ -1454,8 +1578,12 @@ function Switch-Mute {
             $names = [SvAutoMute]::Muted
             Write-ViewerLog "mute on apps=$($names -join ',') error=$([SvAutoMute]::LastError)"
             if ([SvAutoMute]::LastError) { $bar.ShowTip("Muted, but one app failed: $([SvAutoMute]::LastError)", 'mute') }
-            elseif ($names.Count) { $bar.ShowTip("Second screen sound: muted ($($names -join ', '))", 'mute') }
-            else { $bar.ShowTip("Second screen sound: muted (no app there is playing yet; any that starts is muted)", 'mute') }
+            else {
+                $shared = [SvAutoMute]::Shared
+                $msg = if ($names.Count) { "Muted on this screen: $($names -join ', ')" } else { "Mute on (nothing there to mute yet; an app that starts here is muted)" }
+                if ($shared.Count) { $msg += ". Not muted, also on another screen: $($shared -join ', ')" }
+                $bar.ShowTip($msg, 'mute')
+            }
         }
     } catch {
         # Never fail silently: the owner sees why the button did nothing.
